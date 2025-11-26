@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -11,53 +11,75 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 // ======================== 全局参数 ========================
 
 var (
-	listenAddr string
-	serverAddr string
-	serverIP   string
-	token      string
-	dnsServer  string
-	echDomain  string
+	listenAddr    string
+	forwardAddr   string
+	ipAddr        string
+	certFile      string
+	keyFile       string
+	token         string
+	connectionNum int
+
+	dnsServer string
+	echDomain string
 
 	echListMu sync.RWMutex
 	echList   []byte
+
+	echPool *ECHPool
 )
 
 func init() {
-	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
-	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
-	flag.StringVar(&serverIP, "ip", "", "指定服务端 IP（绕过 DNS 解析）")
-	flag.StringVar(&token, "token", "", "身份验证令牌")
-	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "ECH 查询 DNS 服务器")
-	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
+	flag.StringVar(&listenAddr, "l", "", "Listen")
+	flag.StringVar(&forwardAddr, "f", "", "Forward")
+	flag.StringVar(&ipAddr, "ip", "", "IP")
+	flag.StringVar(&certFile, "cert", "", "Cert")
+	flag.StringVar(&keyFile, "key", "", "Key")
+	flag.StringVar(&token, "token", "", "Token")
+	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "DNS")
+	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH")
+	flag.IntVar(&connectionNum, "n", 3, "N")
+	var dummy string
+	flag.StringVar(&dummy, "cidr", "", "ignored")
 }
 
 func main() {
 	flag.Parse()
 
-	if serverAddr == "" {
-		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
+	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
+		runWebSocketServer(listenAddr)
+		return
 	}
-
-	log.Printf("[启动] 正在获取 ECH 配置...")
-	if err := prepareECH(); err != nil {
-		log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
+	if strings.HasPrefix(listenAddr, "tcp://") {
+		if err := prepareECH(); err != nil {
+			log.Fatalf("ECH Fail: %v", err)
+		}
+		runTCPClient(listenAddr, forwardAddr)
+		return
 	}
-
-	runProxyServer(listenAddr)
+	if strings.HasPrefix(listenAddr, "proxy://") {
+		if err := prepareECH(); err != nil {
+			log.Fatalf("ECH Fail: %v", err)
+		}
+		runProxyServer(listenAddr, forwardAddr)
+		return
+	}
+	log.Fatal("Invalid addr")
 }
-
-// ======================== 工具函数 ========================
 
 func isNormalCloseError(err error) bool {
 	if err == nil {
@@ -66,700 +88,596 @@ func isNormalCloseError(err error) bool {
 	if err == io.EOF {
 		return true
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "use of closed network connection") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "normal closure")
+	s := err.Error()
+	return strings.Contains(s, "closed") || strings.Contains(s, "broken pipe") || strings.Contains(s, "reset")
 }
 
-// ======================== ECH 支持 ========================
+// ======================== ECH ========================
 
 const typeHTTPS = 65
 
 func prepareECH() error {
-	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
-	if err != nil {
-		return fmt.Errorf("DNS 查询失败: %w", err)
+	for {
+		b64, err := queryHTTPSRecord(echDomain, dnsServer)
+		if err != nil || b64 == "" {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		echListMu.Lock()
+		echList = raw
+		echListMu.Unlock()
+		return nil
 	}
-	if echBase64 == "" {
-		return errors.New("未找到 ECH 参数")
-	}
-	raw, err := base64.StdEncoding.DecodeString(echBase64)
-	if err != nil {
-		return fmt.Errorf("ECH 解码失败: %w", err)
-	}
-	echListMu.Lock()
-	echList = raw
-	echListMu.Unlock()
-	log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw))
-	return nil
 }
 
-func refreshECH() error {
-	log.Printf("[ECH] 刷新配置...")
-	return prepareECH()
-}
+func refreshECH() { prepareECH() }
 
 func getECHList() ([]byte, error) {
 	echListMu.RLock()
 	defer echListMu.RUnlock()
 	if len(echList) == 0 {
-		return nil, errors.New("ECH 配置未加载")
+		return nil, errors.New("No ECH")
 	}
 	return echList, nil
 }
 
-func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
+func buildTLSConfigWithECH(sn string, el []byte) (*tls.Config, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil {
-		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
+		return nil, err
 	}
 	return &tls.Config{
-		MinVersion:                     tls.VersionTLS13,
-		ServerName:                     serverName,
-		EncryptedClientHelloConfigList: echList,
-		EncryptedClientHelloRejectionVerify: func(cs tls.ConnectionState) error {
-			return errors.New("服务器拒绝 ECH")
-		},
-		RootCAs: roots,
+		MinVersion:                          tls.VersionTLS13,
+		ServerName:                          sn,
+		EncryptedClientHelloConfigList:      el,
+		EncryptedClientHelloRejectionVerify: func(_ tls.ConnectionState) error { return errors.New("ECH rejected") },
+		RootCAs:                             roots,
 	}, nil
 }
 
 func queryHTTPSRecord(domain, dnsServer string) (string, error) {
-	query := buildDNSQuery(domain, typeHTTPS)
-
-	conn, err := net.Dial("udp", dnsServer)
+	q := make([]byte, 0, 512)
+	q = append(q, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0)
+	for _, l := range strings.Split(domain, ".") {
+		q = append(q, byte(len(l)))
+		q = append(q, []byte(l)...)
+	}
+	q = append(q, 0, byte(typeHTTPS>>8), byte(typeHTTPS), 0, 1)
+	c, err := net.Dial("udp", dnsServer)
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
-
-	if _, err = conn.Write(query); err != nil {
-		return "", err
-	}
-
-	response := make([]byte, 4096)
-	n, err := conn.Read(response)
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	c.Write(q)
+	buf := make([]byte, 4096)
+	n, err := c.Read(buf)
 	if err != nil {
 		return "", err
 	}
-	return parseDNSResponse(response[:n])
+	return parseDNSResponse(buf[:n])
 }
 
-func buildDNSQuery(domain string, qtype uint16) []byte {
-	query := make([]byte, 0, 512)
-	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-	for _, label := range strings.Split(domain, ".") {
-		query = append(query, byte(len(label)))
-		query = append(query, []byte(label)...)
+func parseDNSResponse(b []byte) (string, error) {
+	if len(b) < 12 {
+		return "", fmt.Errorf("invalid")
 	}
-	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
-	return query
-}
-
-func parseDNSResponse(response []byte) (string, error) {
-	if len(response) < 12 {
-		return "", errors.New("响应过短")
-	}
-	ancount := binary.BigEndian.Uint16(response[6:8])
+	ancount := binary.BigEndian.Uint16(b[6:8])
 	if ancount == 0 {
-		return "", errors.New("无应答记录")
+		return "", fmt.Errorf("no answer")
 	}
-
-	offset := 12
-	for offset < len(response) && response[offset] != 0 {
-		offset += int(response[offset]) + 1
+	off := 12
+	for off < len(b) && b[off] != 0 {
+		off += int(b[off]) + 1
 	}
-	offset += 5
-
+	off += 5
 	for i := 0; i < int(ancount); i++ {
-		if offset >= len(response) {
+		if off >= len(b) {
 			break
 		}
-		if response[offset]&0xC0 == 0xC0 {
-			offset += 2
+		if b[off]&0xC0 == 0xC0 {
+			off += 2
 		} else {
-			for offset < len(response) && response[offset] != 0 {
-				offset += int(response[offset]) + 1
+			for off < len(b) && b[off] != 0 {
+				off += int(b[off]) + 1
 			}
-			offset++
+			off++
 		}
-		if offset+10 > len(response) {
+		if off+10 > len(b) {
 			break
 		}
-		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
-		offset += 8
-		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
-		offset += 2
-		if offset+int(dataLen) > len(response) {
+		rtype := binary.BigEndian.Uint16(b[off : off+2])
+		off += 8
+		dlen := binary.BigEndian.Uint16(b[off : off+2])
+		off += 2
+		if off+int(dlen) > len(b) {
 			break
 		}
-		data := response[offset : offset+int(dataLen)]
-		offset += int(dataLen)
-
-		if rrType == typeHTTPS {
-			if ech := parseHTTPSRecord(data); ech != "" {
-				return ech, nil
-			}
+		if rtype == typeHTTPS {
+			return parseHTTPSRecord(b[off : off+int(dlen)]), nil
 		}
+		off += int(dlen)
 	}
 	return "", nil
 }
 
-func parseHTTPSRecord(data []byte) string {
-	if len(data) < 2 {
+func parseHTTPSRecord(d []byte) string {
+	if len(d) < 2 {
 		return ""
 	}
-	offset := 2
-	if offset < len(data) && data[offset] == 0 {
-		offset++
+	off := 2
+	if off < len(d) && d[off] == 0 {
+		off++
 	} else {
-		for offset < len(data) && data[offset] != 0 {
-			offset += int(data[offset]) + 1
+		for off < len(d) && d[off] != 0 {
+			off += int(d[off]) + 1
 		}
-		offset++
+		off++
 	}
-	for offset+4 <= len(data) {
-		key := binary.BigEndian.Uint16(data[offset : offset+2])
-		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
-		offset += 4
-		if offset+int(length) > len(data) {
+	for off+4 <= len(d) {
+		k := binary.BigEndian.Uint16(d[off : off+2])
+		l := binary.BigEndian.Uint16(d[off+2 : off+4])
+		off += 4
+		if off+int(l) > len(d) {
 			break
 		}
-		value := data[offset : offset+int(length)]
-		offset += int(length)
-		if key == 5 {
-			return base64.StdEncoding.EncodeToString(value)
+		v := d[off : off+int(l)]
+		off += int(l)
+		if k == 5 {
+			return base64.StdEncoding.EncodeToString(v)
 		}
 	}
 	return ""
 }
 
-// ======================== WebSocket 客户端 ========================
+// ======================== Server ========================
 
-func parseServerAddr(addr string) (host, port, path string, err error) {
-	path = "/"
-	slashIdx := strings.Index(addr, "/")
-	if slashIdx != -1 {
-		path = addr[slashIdx:]
-		addr = addr[:slashIdx]
+func generateSelfSignedCert() (tls.Certificate, error) {
+	k, _ := rsa.GenerateKey(rand.Reader, 2048)
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{Organization: []string{"Self"}},
+		NotBefore: time.Now(), NotAfter: time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-
-	host, port, err = net.SplitHostPort(addr)
-	if err != nil {
-		return "", "", "", fmt.Errorf("无效的服务器地址格式: %v", err)
-	}
-
-	return host, port, path, nil
+	b, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &k.PublicKey, k)
+	cp := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
+	kp := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	return tls.X509KeyPair(cp, kp)
 }
 
-func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
-	host, port, path, err := parseServerAddr(serverAddr)
-	if err != nil {
-		return nil, err
+func runWebSocketServer(addr string) {
+	u, _ := url.Parse(addr)
+	path := u.Path
+	if path == "" {
+		path = "/"
 	}
-
-	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		echBytes, echErr := getECHList()
-		if echErr != nil {
-			if attempt < maxRetries {
-				refreshECH()
-				continue
-			}
-			return nil, echErr
-		}
-
-		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
-		if tlsErr != nil {
-			return nil, tlsErr
-		}
-
-		dialer := websocket.Dialer{
-			TLSClientConfig: tlsCfg,
-			Subprotocols: func() []string {
-				if token == "" {
-					return nil
-				}
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+		Subprotocols: func() []string {
+			if token != "" {
 				return []string{token}
-			}(),
-			HandshakeTimeout: 10 * time.Second,
-		}
-
-		if serverIP != "" {
-			dialer.NetDial = func(network, address string) (net.Conn, error) {
-				_, port, err := net.SplitHostPort(address)
-				if err != nil {
-					return nil, err
-				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
 			}
-		}
-
-		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
-		if dialErr != nil {
-			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
-				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
-				refreshECH()
-				time.Sleep(time.Second)
-				continue
-			}
-			return nil, dialErr
-		}
-
-		return wsConn, nil
+			return nil
+		}(),
+		ReadBufferSize: 65536, WriteBufferSize: 65536,
 	}
-
-	return nil, errors.New("连接失败，已达最大重试次数")
+	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		if token != "" && r.Header.Get("Sec-WebSocket-Protocol") != token {
+			http.Error(w, "Unauthorized", 401)
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go handleWebSocket(ws)
+	})
+	if u.Scheme == "wss" {
+		s := &http.Server{Addr: u.Host}
+		if certFile != "" {
+			s.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+			log.Fatal(s.ListenAndServeTLS(certFile, keyFile))
+		} else {
+			c, _ := generateSelfSignedCert()
+			s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{c}, MinVersion: tls.VersionTLS13}
+			log.Fatal(s.ListenAndServeTLS("", ""))
+		}
+	} else {
+		log.Fatal(http.ListenAndServe(u.Host, nil))
+	}
 }
 
-// ======================== 统一代理服务器 ========================
-
-func runProxyServer(addr string) {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("[代理] 监听失败: %v", err)
-	}
-	defer listener.Close()
-
-	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
-	log.Printf("[代理] 后端服务器: %s", serverAddr)
-	if serverIP != "" {
-		log.Printf("[代理] 使用固定 IP: %s", serverIP)
-	}
-
+func handleWebSocket(ws *websocket.Conn) {
+	var mu sync.Mutex
+	var connMu sync.RWMutex
+	conns := make(map[string]net.Conn)
+	defer func() {
+		connMu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		connMu.Unlock()
+		ws.Close()
+	}()
+	ws.SetPingHandler(func(d string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return ws.WriteMessage(websocket.PongMessage, []byte(d))
+	})
 	for {
-		conn, err := listener.Accept()
+		mt, msg, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("[代理] 接受连接失败: %v", err)
+			return
+		}
+		if mt == websocket.BinaryMessage {
+			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
+				parts := strings.SplitN(string(msg[5:]), "|", 2)
+				if len(parts) == 2 {
+					connMu.RLock()
+					c, ok := conns[parts[0]]
+					connMu.RUnlock()
+					if ok {
+						c.Write([]byte(parts[1]))
+					}
+				}
+			}
 			continue
 		}
-
-		go handleConnection(conn)
-	}
-}
-
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	clientAddr := conn.RemoteAddr().String()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// 读取第一个字节判断协议
-	buf := make([]byte, 1)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
-
-	firstByte := buf[0]
-
-	// 使用 switch 判断协议类型
-	switch firstByte {
-	case 0x05:
-		// SOCKS5 协议
-		handleSOCKS5(conn, clientAddr, firstByte)
-	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
-		// HTTP 协议 (CONNECT, GET, POST, HEAD, DELETE, OPTIONS, TRACE, PUT, PATCH)
-		handleHTTP(conn, clientAddr, firstByte)
-	default:
-		log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, firstByte)
-	}
-}
-
-// ======================== SOCKS5 处理 ========================
-
-func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
-	// 验证版本
-	if firstByte != 0x05 {
-		log.Printf("[SOCKS5] %s 版本错误: 0x%02x", clientAddr, firstByte)
-		return
-	}
-
-	// 读取认证方法数量
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-
-	nmethods := buf[0]
-	methods := make([]byte, nmethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		return
-	}
-
-	// 响应无需认证
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	// 读取请求
-	buf = make([]byte, 4)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-
-	if buf[0] != 5 {
-		return
-	}
-
-	command := buf[1]
-	atyp := buf[3]
-
-	var host string
-	switch atyp {
-	case 0x01: // IPv4
-		buf = make([]byte, 4)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-
-	case 0x03: // 域名
-		buf = make([]byte, 1)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		domainBuf := make([]byte, buf[0])
-		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return
-		}
-		host = string(domainBuf)
-
-	case 0x04: // IPv6
-		buf = make([]byte, 16)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-
-	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	// 读取端口
-	buf = make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-	port := int(buf[0])<<8 | int(buf[1])
-
-	var target string
-	if atyp == 0x04 {
-		target = fmt.Sprintf("[%s]:%d", host, port)
-	} else {
-		target = fmt.Sprintf("%s:%d", host, port)
-	}
-
-	if command != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
-
-	if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
-		if !isNormalCloseError(err) {
-			log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
+		if mt == websocket.TextMessage {
+			s := string(msg)
+			if strings.HasPrefix(s, "TCP:") {
+				parts := strings.SplitN(s[4:], "|", 3)
+				if len(parts) >= 2 {
+					id, tgt := parts[0], parts[1]
+					first := ""
+					if len(parts) == 3 {
+						first = parts[2]
+					}
+					go handleTCPConn(ws, &mu, &connMu, conns, id, tgt, first)
+				}
+			} else if strings.HasPrefix(s, "CLOSE:") {
+				id := strings.TrimPrefix(s, "CLOSE:")
+				connMu.Lock()
+				if c, ok := conns[id]; ok {
+					c.Close()
+					delete(conns, id)
+				}
+				connMu.Unlock()
+			}
 		}
 	}
 }
 
-// ======================== HTTP 处理 ========================
-
-func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
-	// 将第一个字节放回缓冲区
-	reader := bufio.NewReader(io.MultiReader(
-		strings.NewReader(string(firstByte)),
-		conn,
-	))
-
-	// 读取 HTTP 请求行
-	requestLine, err := reader.ReadString('\n')
+func handleTCPConn(ws *websocket.Conn, mu *sync.Mutex, connMu *sync.RWMutex, conns map[string]net.Conn, id, tgt, first string) {
+	c, err := net.DialTimeout("tcp", tgt, 10*time.Second)
 	if err != nil {
+		mu.Lock()
+		ws.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
+		mu.Unlock()
 		return
 	}
-
-	parts := strings.Fields(requestLine)
-	if len(parts) < 3 {
-		return
+	connMu.Lock()
+	conns[id] = c
+	connMu.Unlock()
+	defer func() {
+		c.Close()
+		connMu.Lock()
+		delete(conns, id)
+		connMu.Unlock()
+	}()
+	if first != "" {
+		c.Write([]byte(first))
 	}
-
-	method := parts[0]
-	requestURL := parts[1]
-	httpVersion := parts[2]
-
-	// 读取所有 headers
-	headers := make(map[string]string)
-	var headerLines []string
+	mu.Lock()
+	ws.WriteMessage(websocket.TextMessage, []byte("CONNECTED:"+id))
+	mu.Unlock()
+	buf := make([]byte, 32768)
 	for {
-		line, err := reader.ReadString('\n')
+		n, err := c.Read(buf)
+		if err != nil {
+			mu.Lock()
+			ws.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
+			mu.Unlock()
+			return
+		}
+		mu.Lock()
+		ws.WriteMessage(websocket.BinaryMessage, append([]byte("DATA:"+id+"|"), buf[:n]...))
+		mu.Unlock()
+	}
+}
+
+// ======================== Client Pool ========================
+
+type ECHPool struct {
+	wsAddr string
+	n      int
+	conns  []*websocket.Conn
+	locks  []sync.Mutex
+	rr     int
+	mu     sync.Mutex
+	tcpMap sync.Map
+}
+
+func NewECHPool(addr string, n int) *ECHPool {
+	return &ECHPool{
+		wsAddr: addr, n: n,
+		conns: make([]*websocket.Conn, n),
+		locks: make([]sync.Mutex, n),
+	}
+}
+
+func (p *ECHPool) Start() {
+	for i := 0; i < p.n; i++ {
+		go p.dial(i)
+	}
+}
+
+func (p *ECHPool) dial(idx int) {
+	for {
+		ws, err := dialWebSocketWithECH(p.wsAddr, 2)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		log.Printf("Channel %d connected", idx)
+		p.conns[idx] = ws
+		p.handle(idx, ws)
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (p *ECHPool) handle(idx int, ws *websocket.Conn) {
+	ws.SetPingHandler(func(d string) error {
+		p.locks[idx].Lock()
+		defer p.locks[idx].Unlock()
+		return ws.WriteMessage(websocket.PongMessage, []byte(d))
+	})
+	for {
+		mt, msg, err := ws.ReadMessage()
 		if err != nil {
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			break
-		}
-		headerLines = append(headerLines, line)
-		if idx := strings.Index(line, ":"); idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
-			headers[strings.ToLower(key)] = value
+		if mt == websocket.BinaryMessage {
+			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
+				parts := strings.SplitN(string(msg[5:]), "|", 2)
+				if len(parts) == 2 {
+					if c, ok := p.tcpMap.Load(parts[0]); ok {
+						c.(net.Conn).Write([]byte(parts[1]))
+					}
+				}
+			}
+		} else if mt == websocket.TextMessage {
+			s := string(msg)
+			if strings.HasPrefix(s, "CLOSE:") {
+				id := strings.TrimPrefix(s, "CLOSE:")
+				if c, ok := p.tcpMap.Load(id); ok {
+					c.(net.Conn).Close()
+					p.tcpMap.Delete(id)
+				}
+			}
 		}
 	}
+}
 
-	switch method {
-	case "CONNECT":
-		// HTTPS 隧道代理 - 需要发送 200 响应
-		log.Printf("[HTTP-CONNECT] %s -> %s", clientAddr, requestURL)
-		if err := handleTunnel(conn, requestURL, clientAddr, modeHTTPConnect, ""); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[HTTP-CONNECT] %s 代理失败: %v", clientAddr, err)
-			}
+func (p *ECHPool) Send(connID, target, first string, conn net.Conn) {
+	p.tcpMap.Store(connID, conn)
+	p.mu.Lock()
+	idx := p.rr
+	p.rr = (p.rr + 1) % p.n
+	p.mu.Unlock()
+
+	p.locks[idx].Lock()
+	ws := p.conns[idx]
+	if ws == nil {
+		p.locks[idx].Unlock()
+		conn.Close()
+		return
+	}
+	ws.WriteMessage(websocket.TextMessage, []byte("TCP:"+connID+"|"+target+"|"+first))
+	p.locks[idx].Unlock()
+
+	defer func() {
+		p.locks[idx].Lock()
+		if p.conns[idx] != nil {
+			p.conns[idx].WriteMessage(websocket.TextMessage, []byte("CLOSE:"+connID))
 		}
+		p.locks[idx].Unlock()
+		p.tcpMap.Delete(connID)
+		conn.Close()
+	}()
 
-	case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE":
-		// HTTP 代理 - 直接转发，不发送 200 响应
-		log.Printf("[HTTP-%s] %s -> %s", method, clientAddr, requestURL)
-
-		var target string
-		var path string
-
-		if strings.HasPrefix(requestURL, "http://") {
-			// 解析完整 URL
-			urlWithoutScheme := strings.TrimPrefix(requestURL, "http://")
-			idx := strings.Index(urlWithoutScheme, "/")
-			if idx > 0 {
-				target = urlWithoutScheme[:idx]
-				path = urlWithoutScheme[idx:]
-			} else {
-				target = urlWithoutScheme
-				path = "/"
-			}
-		} else {
-			// 相对路径，从 Host header 获取
-			target = headers["host"]
-			path = requestURL
-		}
-
-		if target == "" {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+	buf := make([]byte, 32768)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
 			return
 		}
-
-		// 添加默认端口
-		if !strings.Contains(target, ":") {
-			target += ":80"
+		p.locks[idx].Lock()
+		if p.conns[idx] == nil {
+			p.locks[idx].Unlock()
+			return
 		}
+		err = p.conns[idx].WriteMessage(websocket.BinaryMessage, append([]byte("DATA:"+connID+"|"), buf[:n]...))
+		p.locks[idx].Unlock()
+		if err != nil {
+			return
+		}
+	}
+}
 
-		// 重构 HTTP 请求（去掉完整 URL，使用相对路径）
-		var requestBuilder strings.Builder
-		requestBuilder.WriteString(fmt.Sprintf("%s %s %s\r\n", method, path, httpVersion))
+// ======================== Client Entry ========================
 
-		// 写入 headers（过滤掉 Proxy-Connection）
-		for _, line := range headerLines {
-			key := strings.Split(line, ":")[0]
-			keyLower := strings.ToLower(strings.TrimSpace(key))
-			if keyLower != "proxy-connection" && keyLower != "proxy-authorization" {
-				requestBuilder.WriteString(line)
-				requestBuilder.WriteString("\r\n")
+func runTCPClient(listen, server string) {
+	listen = strings.TrimPrefix(listen, "tcp://")
+	parts := strings.Split(listen, "/")
+	if len(parts) < 2 {
+		log.Fatal("invalid listen addr")
+	}
+	echPool = NewECHPool(server, connectionNum)
+	echPool.Start()
+	l, _ := net.Listen("tcp", parts[0])
+	log.Printf("TCP Start: %s -> %s", parts[0], parts[1])
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			continue
+		}
+		go func() {
+			id := uuid.New().String()
+			buf := make([]byte, 32768)
+			n, _ := c.Read(buf)
+			echPool.Send(id, parts[1], string(buf[:n]), c)
+		}()
+	}
+}
+
+func runProxyServer(addr, server string) {
+	c, _ := parseProxyAddr(addr)
+	l, _ := net.Listen("tcp", c.Host)
+	log.Printf("Proxy Start: %s", c.Host)
+	echPool = NewECHPool(server, connectionNum)
+	echPool.Start()
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			continue
+		}
+		go handleProxy(conn, c)
+	}
+}
+
+func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
+	u, _ := url.Parse(wsAddr)
+	if u.Scheme != "wss" {
+		return nil, fmt.Errorf("must use wss")
+	}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 5 * time.Second,
+	}
+	if token != "" {
+		dialer.Subprotocols = []string{token}
+	}
+	if ipAddr != "" {
+		dialer.NetDial = func(n, a string) (net.Conn, error) {
+			// 修复: 无论解析出什么端口，强制使用 443 (CF Worker 限制)
+			return net.DialTimeout(n, net.JoinHostPort(ipAddr, "443"), 5*time.Second)
+		}
+	}
+	sn := u.Hostname()
+	for i := 0; i <= retries; i++ {
+		el, err := getECHList()
+		if err != nil {
+			refreshECH()
+			continue
+		}
+		cfg, _ := buildTLSConfigWithECH(sn, el)
+		dialer.TLSClientConfig = cfg
+		ws, _, err := dialer.Dial(wsAddr, nil)
+		if err != nil {
+			if strings.Contains(err.Error(), "ECH") {
+				refreshECH()
 			}
+			continue
 		}
-		requestBuilder.WriteString("\r\n")
+		return ws, nil
+	}
+	return nil, fmt.Errorf("fail")
+}
 
-		// 如果有请求体，需要读取并附加
-		if contentLength := headers["content-length"]; contentLength != "" {
-			var length int
-			fmt.Sscanf(contentLength, "%d", &length)
-			if length > 0 && length < 10*1024*1024 { // 限制 10MB
-				body := make([]byte, length)
-				if _, err := io.ReadFull(reader, body); err == nil {
-					requestBuilder.Write(body)
+// ======================== Proxy ========================
+
+type ProxyConfig struct {
+	Username, Password, Host string
+}
+
+func parseProxyAddr(addr string) (*ProxyConfig, error) {
+	addr = strings.TrimPrefix(addr, "proxy://")
+	c := &ProxyConfig{}
+	if strings.Contains(addr, "@") {
+		pts := strings.SplitN(addr, "@", 2)
+		up := strings.SplitN(pts[0], ":", 2)
+		if len(up) == 2 {
+			c.Username, c.Password = up[0], up[1]
+		}
+		c.Host = pts[1]
+	} else {
+		c.Host = addr
+	}
+	return c, nil
+}
+
+func handleProxy(conn net.Conn, cfg *ProxyConfig) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	b := make([]byte, 1)
+	if _, err := io.ReadFull(conn, b); err != nil {
+		conn。Close()
+		return
+	}
+	conn。SetReadDeadline(time。Time{})
+	if b[0] == 0x05 {
+		conn。Write([]byte{0x05， 0x00})
+		h := make([]byte, 4)
+		io。ReadFull(conn, h)
+		if h[1] != 0x01 {
+			conn。Close()
+			return
+		}
+		var tgt string
+		switch h[3] {
+		case 1:
+			b := make([]byte, 4)
+			io。ReadFull(conn, b)
+			tgt = fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
+		case 3:
+			b := make([]byte, 1)
+			io.ReadFull(conn, b)
+			d := make([]byte, int(b[0]))
+			io。ReadFull(conn, d)
+			tgt = string(d)
+		}
+		pb := make([]byte, 2)
+		io。ReadFull(conn, pb)
+		tgt += fmt。Sprintf(":%d"， int(pb[0])<<8|int(pb[1]))
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		echPool.Send(uuid.New().String(), tgt, "", conn)
+	} else {
+		// Simple HTTP
+		buf := bytes.NewBuffer(b)
+		p := make([]byte, 4096)
+		n, _ := conn.Read(p)
+		full := append(buf。Bytes(), p[:n]。。.)
+		lines := strings.Split(string(full), "\r\n")
+		parts := strings.Split(lines[0], " ")
+		if len(parts) < 2 {
+			conn.Close()
+			return
+		}
+		var tgt string
+		if parts[0] == "CONNECT" {
+			tgt = parts[1]
+			conn。Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			full = nil
+		} else {
+			u, _ := url.Parse(parts[1])
+			tgt = u.Host
+			if tgt == "" {
+				for _, l := range lines {
+					if strings.HasPrefix(l, "Host:") {
+						tgt = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
+						break
+					}
 				}
 			}
-		}
-
-		firstFrame := requestBuilder.String()
-
-		// 使用 modeHTTPProxy 模式（不发送 200 响应）
-		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, firstFrame); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[HTTP-%s] %s 代理失败: %v", method, clientAddr, err)
+			if !strings.Contains(tgt, ":") {
+				tgt += ":80"
 			}
 		}
-
-	default:
-		log.Printf("[HTTP] %s 不支持的方法: %s", clientAddr, method)
-		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+		echPool.Send(uuid.New().String(), tgt, string(full), conn)
 	}
-}
-
-// ======================== 通用隧道处理 ========================
-
-// 代理模式常量
-const (
-	modeSOCKS5      = 1 // SOCKS5 代理
-	modeHTTPConnect = 2 // HTTP CONNECT 隧道
-	modeHTTPProxy   = 3 // HTTP 普通代理（GET/POST等）
-)
-
-func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
-	wsConn, err := dialWebSocketWithECH(2)
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-	defer wsConn.Close()
-
-	var mu sync.Mutex
-
-	// 保活
-	stopPing := make(chan bool)
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				wsConn.WriteMessage(websocket.PingMessage, nil)
-				mu.Unlock()
-			case <-stopPing:
-				return
-			}
-		}
-	}()
-	defer close(stopPing)
-
-	conn.SetDeadline(time.Time{})
-
-	// 如果没有预设的 firstFrame，尝试读取第一帧数据（仅 SOCKS5）
-	if firstFrame == "" && mode == modeSOCKS5 {
-		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buffer := make([]byte, 32768)
-		n, _ := conn.Read(buffer)
-		_ = conn.SetReadDeadline(time.Time{})
-		if n > 0 {
-			firstFrame = string(buffer[:n])
-		}
-	}
-
-	// 发送连接请求
-	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
-	mu.Lock()
-	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
-	mu.Unlock()
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-
-	// 等待响应
-	_, msg, err := wsConn.ReadMessage()
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-
-	response := string(msg)
-	if strings.HasPrefix(response, "ERROR:") {
-		sendErrorResponse(conn, mode)
-		return errors.New(response)
-	}
-	if response != "CONNECTED" {
-		sendErrorResponse(conn, mode)
-		return fmt.Errorf("意外响应: %s", response)
-	}
-
-	// 发送成功响应（根据模式不同而不同）
-	if err := sendSuccessResponse(conn, mode); err != nil {
-		return err
-	}
-
-	log.Printf("[代理] %s 已连接: %s", clientAddr, target)
-
-	// 双向转发
-	done := make(chan bool, 2)
-
-	// Client -> Server
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				mu.Lock()
-				wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
-				mu.Unlock()
-				done <- true
-				return
-			}
-
-			mu.Lock()
-			err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
-			mu.Unlock()
-			if err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	// Server -> Client
-	go func() {
-		for {
-			mt, msg, err := wsConn.ReadMessage()
-			if err != nil {
-				done <- true
-				return
-			}
-
-			if mt == websocket.TextMessage {
-				if string(msg) == "CLOSE" {
-					done <- true
-					return
-				}
-			}
-
-			if _, err := conn.Write(msg); err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	<-done
-	log.Printf("[代理] %s 已断开: %s", clientAddr, target)
-	return nil
-}
-
-// ======================== 响应辅助函数 ========================
-
-func sendErrorResponse(conn net.Conn, mode int) {
-	switch mode {
-	case modeSOCKS5:
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	case modeHTTPConnect, modeHTTPProxy:
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-	}
-}
-
-func sendSuccessResponse(conn net.Conn, mode int) error {
-	switch mode {
-	case modeSOCKS5:
-		// SOCKS5 成功响应
-		_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return err
-	case modeHTTPConnect:
-		// HTTP CONNECT 需要发送 200 响应
-		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		return err
-	case modeHTTPProxy:
-		// HTTP GET/POST 等不需要发送响应，直接转发目标服务器的响应
-		return nil
-	}
-	return nil
 }
