@@ -16,7 +16,7 @@ else
 fi
 
 # 2. Token (-token)
-if [ -n "$ECH_TOKEN" ]; 键，然后
+if [ -n "$ECH_TOKEN" ]; then
     set -- "$@" -token "$ECH_TOKEN"
 else
     echo "Error: ECH_TOKEN (密码) 必须设置！"
@@ -26,17 +26,17 @@ fi
 # --- 选填参数检测 (有则加，无则忽略) ---
 
 # 3. 转发目标 (-f) [客户端必填]
-if [ -n "$ECH_FORWARD" ]; 键，然后
+if [ -n "$ECH_FORWARD" ]; then
     set -- "$@" -f "$ECH_FORWARD"
 fi
 
 # 4. 并发数 (-n)
-if [ -n "$ECH_CONCURRENCY" ]; 键，然后
+if [ -n "$ECH_CONCURRENCY" ]; then
     set -- "$@" -n "$ECH_CONCURRENCY"
 fi
 
 # 5. 自定义证书 (-cert) [服务端用]
-if [ -n "$ECH_CERT" ]; 键，然后
+if [ -n "$ECH_CERT" ]; then
     set -- "$@" -cert "$ECH_CERT"
 fi
 
