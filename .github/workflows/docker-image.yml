@@ -1,38 +1,45 @@
-name: Docker Build and Push
+# 使用最基础的 Alpine 镜像
+FROM alpine:latest
 
-on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - "Dockerfile"
-      - "ech-workers-linux-amd64"
-      - "entrypoint.sh"
-  workflow_dispatch:              # 允许手动触发
+# 安装运行时库
+RUN apk add --no-cache ca-certificates libc6-compat tzdata
 
-jobs:
-  docker:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-          
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+WORKDIR /app
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          # 仅构建 amd64 (对应你提供的二进制文件架构)
-          platforms: linux/amd64
-          # 指定具体的标签
-          tags: mimimimimimimiiii/ech-cf:latest
+# 1. 复制二进制文件 (确保文件名完全一致)
+COPY ech-workers-linux-amd64 /app/ech-tunnel
+
+# 2. [绝杀] 直接在 Dockerfile 里生成启动脚本
+# 这样绝对不会有 Windows 换行符问题
+RUN printf '#!/bin/sh\n\
+\n\
+# 设置二进制路径\n\
+set -- /app/ech-tunnel\n\
+\n\
+# 1. 监听地址\n\
+if [ -n "$ECH_LISTEN" ]; then\n\
+    set -- "$@" -l "$ECH_LISTEN"\n\
+else\n\
+    echo "Info: Default listen 127.0.0.1:30000"\n\
+    set -- "$@" -l "127.0.0.1:30000"\n\
+fi\n\
+\n\
+# 2. 转发目标\n\
+if [ -n "$ECH_FORWARD" ]; then\n\
+    set -- "$@" -f "$ECH_FORWARD"\n\
+fi\n\
+\n\
+# 3. Token (必填)\n\
+if [ -n "$ECH_TOKEN" ]; then\n\
+    set -- "$@" -token "$ECH_TOKEN"\n\
+else\n\
+    echo "Error: ECH_TOKEN is required!"\n\
+    exit 1\n\
+fi\n\
+\n\
+# 4. 其他参数\n\
+if [ -n "$ECH_EXIT_IP" ]; then set -- "$@" -ip "$ECH_EXIT_IP"; fi\n\
+if [ -n "$ECH_DOMAIN" ]; then set -- "$@" -ech "$ECH_DOMAIN"; fi\n\
+if [ -n "$ECH_DNS" ]; then set -- "$@" -dns "$ECH_DNS"; fi\n\
+\n\
+echo "Starting ECH
