@@ -14,7 +14,7 @@ COPY ech-workers-linux-amd64 /app/ech-tunnel
 RUN printf '#!/bin/sh\n\
 \n\
 # 默认参数\n\
-LISTEN_ADDR="127。0。0。1:30000"\n\
+LISTEN_ADDR="0。0。0。0:30000"\n\
 \n\
 # 1. 处理监听地址 (去除 proxy:// 前缀)\n\
 if [ -n "$ECH_LISTEN" ]; then\n\
