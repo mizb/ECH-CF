@@ -1,25 +1,17 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -35,11 +27,8 @@ var (
 	listenAddr    string
 	forwardAddr   string
 	ipAddr        string
-	certFile      string
-	keyFile       string
 	token         string
-	cidrs         string
-	connectionNum int // 这里代表“每个地址的并发数”
+	connectionNum int // 单地址并发数
 
 	// ECH/DNS 参数
 	dnsServer string
@@ -57,14 +46,16 @@ func init() {
 	flag.StringVar(&listenAddr, "l", "", "监听地址 (例如 proxy://0.0.0.0:1080)")
 	flag.StringVar(&forwardAddr, "f", "", "服务端地址 (支持逗号分隔: wss://a.com,wss://b.com)")
 	flag.StringVar(&ipAddr, "ip", "", "指定解析 IP (仅客户端)")
-	flag.StringVar(&certFile, "cert", "", "证书路径 (仅服务端)")
-	flag.StringVar(&keyFile, "key", "", "私钥路径 (仅服务端)")
 	flag.StringVar(&token, "token", "", "认证 Token")
-	flag.StringVar(&cidrs, "cidr", "0.0.0.0/0,::/0", "允许 IP 段")
 	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "DNS 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
-	// 【核心修改】这里定义的是“单地址并发数”
-	flag.IntVar(&connectionNum, "n", 7, "单地址并发通道数 (总通道数 = 地址数 * n)")
+	flag.IntVar(&connectionNum, "n", 7, "单地址并发通道数")
+	
+	// 为了兼容旧版参数解析，这里添加一些未使用参数的占位，避免报错
+	var dummy string
+	flag.StringVar(&dummy, "cert", "", "ignored")
+	flag.StringVar(&dummy, "key", "", "ignored")
+	flag.StringVar(&dummy, "cidr", "", "ignored")
 }
 
 func main() {
@@ -83,9 +74,9 @@ func main() {
 	}
 
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
-		runWebSocketServer(listenAddr)
-		return
+		log.Fatal("当前版本仅支持客户端/代理模式 (Client/Proxy Mode Only)")
 	}
+
 	if strings.HasPrefix(listenAddr, "tcp://") {
 		if len(forwardAddrs) == 0 {
 			log.Fatal("客户端模式必须指定服务端地址 (-f)")
@@ -109,24 +100,12 @@ func main() {
 	log.Fatal("监听地址格式错误")
 }
 
-func isNormalCloseError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == io.EOF {
-		return true
-	}
-	s := err.Error()
-	return strings.Contains(s, "closed network connection") || strings.Contains(s, "broken pipe") || strings.Contains(s, "reset by peer")
-}
-
 // ======================== ECH Logic ========================
 
 const typeHTTPS = 65
 
 func prepareECH() error {
 	for {
-		// log.Printf("查询 ECH: %s via %s", echDomain, dnsServer)
 		b64, err := queryHTTPSRecord(echDomain, dnsServer)
 		if err != nil || b64 == "" {
 			time.Sleep(2 * time.Second)
@@ -268,8 +247,8 @@ func parseHTTPSRecord(d []byte) string {
 
 type ECHPool struct {
 	wsServerAddrs []string
-	perAddrNum    int // 单个地址的并发数
-	totalNum      int // 总并发数 = addrs * perAddrNum
+	perAddrNum    int
+	totalNum      int
 
 	conns []*websocket.Conn
 	locks []sync.Mutex
@@ -292,14 +271,13 @@ func NewECHPool(addrs []string, n int) *ECHPool {
 
 func (p *ECHPool) Start() {
 	globalIdx := 0
-	// 双重循环：遍历每个地址，为每个地址启动 n 条连接
 	for _, addr := range p.wsServerAddrs {
 		for i := 0; i < p.perAddrNum; i++ {
 			go p.maintainConn(globalIdx, addr)
 			globalIdx++
 		}
 	}
-	log.Printf("[连接池] 启动完成。监控地址数: %d, 单地址通道: %d, 总通道数: %d", len(p.wsServerAddrs), p.perAddrNum, p.totalNum)
+	log.Printf("[连接池] 启动完成。总通道数: %d (地址数:%d * 并发:%d)", p.totalNum, len(p.wsServerAddrs), p.perAddrNum)
 }
 
 func (p *ECHPool) maintainConn(idx int, addr string) {
@@ -322,21 +300,18 @@ func (p *ECHPool) RegisterAndClaim(connID, target, first string, tcpConn net.Con
 	ch := make(chan bool, 1)
 	p.connected.Store(connID, ch)
 
-	// 广播竞速：向所有（21条）通道同时发送 CLAIM
-	// 任何一条通道（无论属于哪个地址）先回包，就用哪条
+	// 广播竞速
 	for i := 0; i < p.totalNum; i++ {
 		ws := p.conns[i]
 		if ws == nil {
 			continue
 		}
-		// 异步发送以避免阻塞
 		go func(idx int, w *websocket.Conn) {
 			p.locks[idx].Lock()
 			w.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("CLAIM:%s|%d", connID, idx)))
 			p.locks[idx].Unlock()
 		}(i, ws)
 	}
-
 	p.chMap.Store(connID+"_META", fmt.Sprintf("%s|%s", target, first))
 }
 
@@ -411,7 +386,6 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 		}
 		if mt == websocket.BinaryMessage {
 			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
-				// UDP logic omitted for brevity in TCP context
 				continue
 			}
 			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
@@ -430,7 +404,6 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 				parts := strings.SplitN(s[10:], "|", 2)
 				if len(parts) == 2 {
 					connID := parts[0]
-					// 只有第一个到达的 CLAIM_ACK 能写入 chMap，其他忽略
 					if _, loaded := p.chMap.LoadOrStore(connID, idx); !loaded {
 						if meta, ok := p.chMap.Load(connID + "_META"); ok {
 							ms := strings.SplitN(meta.(string), "|", 2)
@@ -483,7 +456,6 @@ func runTCPClient(listen string, addrs []string) {
 		go func() {
 			id := uuid.New().String()
 			p := make([]byte, 32768)
-			// Read first packet to determine protocol/sni/etc if needed, or just data
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, _ := c.Read(p)
 			c.SetReadDeadline(time.Time{})
@@ -512,8 +484,7 @@ func runProxyServer(addr string, addrs []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("代理启动: %s (服务器: %d 个, 单机并发: %d, 总通道: %d)",
-		config.Host, len(addrs), connectionNum, len(addrs)*connectionNum)
+	log.Printf("代理启动: %s", config.Host)
 
 	echPool = NewECHPool(addrs, connectionNum)
 	echPool.Start()
@@ -602,22 +573,19 @@ func handleProxyConnection(conn net.Conn, cfg *ProxyConfig) {
 	}
 }
 
-// SOCKS5/HTTP 简化版实现，保留核心转发逻辑
 func handleSOCKS5(conn net.Conn, cfg *ProxyConfig) {
-	// 简单握手: 忽略认证细节，直接接受
 	conn.Write([]byte{0x05, 0x00})
-	// 读请求
 	buf := make([]byte, 262)
 	io.ReadFull(conn, buf[:4])
-	if buf[1] != 0x01 { // 只支持 CONNECT
+	if buf[1] != 0x01 {
 		return
 	}
 	var target string
 	switch buf[3] {
-	case 1: // IPv4
+	case 1:
 		io.ReadFull(conn, buf[:4])
 		target = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
-	case 3: // Domain
+	case 3:
 		io.ReadFull(conn, buf[:1])
 		l := int(buf[0])
 		io.ReadFull(conn, buf[:l])
@@ -626,9 +594,8 @@ func handleSOCKS5(conn net.Conn, cfg *ProxyConfig) {
 	io.ReadFull(conn, buf[:2])
 	target += fmt.Sprintf(":%d", int(buf[0])<<8|int(buf[1]))
 
-	// 建立连接
 	id := uuid.New().String()
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // 响应成功
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	echPool.RegisterAndClaim(id, target, "", conn)
 	if !echPool.WaitConnected(id, 5*time.Second) {
@@ -647,9 +614,7 @@ func handleSOCKS5(conn net.Conn, cfg *ProxyConfig) {
 }
 
 func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
-	// 极简 HTTP 转发逻辑
 	buf := bytes.NewBuffer([]byte{first})
-	// 读取前面的部分以获取 Host
 	p := make([]byte, 4096)
 	n, _ := conn.Read(p)
 	full := append(buf.Bytes(), p[:n]...)
@@ -666,12 +631,11 @@ func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
 	if method == "CONNECT" {
 		target = urlStr
 		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-		full = nil // CONNECT 不发送 header 给后端
+		full = nil
 	} else {
 		u, _ := url.Parse(urlStr)
 		target = u.Host
 		if target == "" {
-			// 尝试从 Host 头获取
 			for _, l := range lines {
 				if strings.HasPrefix(l, "Host:") {
 					target = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
@@ -700,6 +664,3 @@ func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
 		echPool.SendData(id, b[:n])
 	}
 }
-
-// ======================== Server Stub (Not used in client mode) ========================
-func runWebSocketServer(addr string) { log.Fatal("Server mode not optimized in this version") }
