@@ -3,13 +3,14 @@ name: Docker Build and Push
 on:
   push:
     branches: [ "main" ]
-    # 监控这些文件的变化，有变动才触发构建
     paths:
       - "Dockerfile"
-      - "entrypoint.sh"
-      - "main.go"
-      - "go.mod"
+      - "ech-tunnel-linux-amd64"  # 当二进制文件更新时也触发
   workflow_dispatch:              # 允许手动触发
+
+env:
+  # 在这里修改你的镜像名，格式：DockerHub用户名/仓库名
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ech-client
 
 jobs:
   docker:
@@ -23,28 +24,20 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          # 你的参考代码里用的是 PASSWORD，这里保持一致
+          # 建议去 GitHub Settings -> Secrets 里把原来的 PASSWORD 改名为 TOKEN
+          # 或者你这里继续用 PASSWORD 也行，只要 Secrets 里有这个变量
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
           
-      # [新增] 设置 QEMU
-      # 这是源码构建的核心！它允许 Ubuntu(amd64) 编译 arm64 的程序
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      
       # 设置 Buildx (构建工具)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push multi-arch Docker image
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: 。
           file: ./Dockerfile
           push: true
-          # [核心升级] 
-          # 因为我们有源码，这里可以同时构建 amd64 和 arm64！
-          # 你的镜像将能运行在任何服务器、树莓派或 M1 Mac 上
-          platforms: linux/amd64,linux/arm64
-          
-          # 你指定的镜像名和标签
-          tags: mimimimimimimiiii/ech-cf:latest
+          # 关键点：因为你只有 amd64 的文件，这里只能填这一种
+          platforms: linux/amd64
+          标签: mimimimimimimiiii/ech-cf:latest
