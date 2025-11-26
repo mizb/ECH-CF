@@ -5,12 +5,11 @@ on:
     branches: [ "main" ]
     paths:
       - "Dockerfile"
-      - "ech-tunnel-linux-amd64"  # 当二进制文件更新时也触发
   workflow_dispatch:              # 允许手动触发
 
 env:
   # 在这里修改你的镜像名，格式：DockerHub用户名/仓库名
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ech-client
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ech-cf
 
 jobs:
   docker:
