@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -36,32 +35,27 @@ var (
 	certFile      string
 	keyFile       string
 	token         string
-	cidrs         string
 	connectionNum int
 
-	// ECH/DNS 参数
 	dnsServer string
 	echDomain string
 
-	// 运行期缓存
 	echListMu sync.RWMutex
 	echList   []byte
 
-	// 连接池
 	echPool *ECHPool
 )
 
 func init() {
-	flag.StringVar(&listenAddr, "l", "", "Listen Addr")
-	flag.StringVar(&forwardAddr, "f", "", "Forward Addr")
-	flag.StringVar(&ipAddr, "ip", "", "Specific IP")
+	flag.StringVar(&listenAddr, "l", "", "Listen")
+	flag.StringVar(&forwardAddr, "f", "", "Forward")
+	flag.StringVar(&ipAddr, "ip", "", "IP")
 	flag.StringVar(&certFile, "cert", "", "Cert")
 	flag.StringVar(&keyFile, "key", "", "Key")
 	flag.StringVar(&token, "token", "", "Token")
 	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "DNS")
-	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH Domain")
-	flag.IntVar(&connectionNum, "n", 3, "Concurrency")
-	
+	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH")
+	flag.IntVar(&connectionNum, "n", 3, "N")
 	var dummy string
 	flag.StringVar(&dummy, "cidr", "", "ignored")
 }
@@ -69,7 +63,6 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// 简单的参数校验
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
 		runWebSocketServer(listenAddr)
 		return
@@ -88,8 +81,7 @@ func main() {
 		runProxyServer(listenAddr, forwardAddr)
 		return
 	}
-
-	log.Fatal("Invalid address format")
+	log.Fatal("Invalid addr")
 }
 
 func isNormalCloseError(err error) bool {
@@ -99,7 +91,7 @@ func isNormalCloseError(err error) bool {
 	return strings.Contains(s, "closed") || strings.Contains(s, "broken pipe") || strings.Contains(s, "reset")
 }
 
-// ======================== ECH Logic ========================
+// ======================== ECH ========================
 
 const typeHTTPS = 65
 
@@ -127,7 +119,7 @@ func refreshECH() { prepareECH() }
 func getECHList() ([]byte, error) {
 	echListMu.RLock()
 	defer echListMu.RUnlock()
-	if len(echList) == 0 { return nil, errors.New("ECH not loaded") }
+	if len(echList) == 0 { return nil, errors.New("No ECH") }
 	return echList, nil
 }
 
@@ -199,7 +191,7 @@ func parseHTTPSRecord(d []byte) string {
 	return ""
 }
 
-// ======================== Server (With http import used) ========================
+// ======================== Server ========================
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	k, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -453,7 +445,7 @@ func (p *ECHPool) Send(connID, target, first string, conn net.Conn) {
 	}
 }
 
-// ======================== Client Runners ========================
+// ======================== Client Entry ========================
 
 func runTCPClient(listen, server string) {
 	listen = strings.TrimPrefix(listen, "tcp://")
@@ -486,7 +478,7 @@ func runProxyServer(addr, server string) {
 	for {
 		conn, err := l.Accept()
 		if err != nil { continue }
-		go handleProxyConnection(conn, c)
+		go handleProxy(conn, c)
 	}
 }
 
@@ -503,7 +495,7 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 	}
 	if ipAddr != "" {
 		dialer.NetDial = func(n, a string) (net.Conn, error) {
-			// 强制使用 443 端口，解决丢端口问题
+			// 强制使用 443
 			return net.DialTimeout(n, net.JoinHostPort(ipAddr, "443"), 5*time.Second)
 		}
 	}
@@ -528,7 +520,7 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 	return nil, fmt.Errorf("fail")
 }
 
-// ======================== Proxy Helpers ========================
+// ======================== Proxy ========================
 
 type ProxyConfig struct {
 	Username, Password, Host string
@@ -550,112 +542,74 @@ func parseProxyAddr(addr string) (*ProxyConfig, error) {
 	return c, nil
 }
 
-func validateProxyAuth(authHeader, username, password string) bool {
-	if authHeader == "" { return false }
-	if !strings.HasPrefix(authHeader, "Basic ") { return false }
-	encoded := strings.TrimPrefix(authHeader, "Basic ")
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil { return false }
-	parts := strings.SplitN(string(decoded), ":", 2)
-	return len(parts) == 2 && parts[0] == username && parts[1] == password
-}
-
-func handleProxyConnection(conn net.Conn, cfg *ProxyConfig) {
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	// 使用 io.ReadFull 替代 bytes.NewBuffer 读取首字节
+func handleProxy(conn net.Conn, cfg *ProxyConfig) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	b := make([]byte, 1)
 	if _, err := io.ReadFull(conn, b); err != nil {
+		conn.Close()
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
 	if b[0] == 0x05 {
-		handleSOCKS5(conn, cfg)
-	} else {
-		handleHTTP(conn, cfg, b[0])
-	}
-}
-
-func handleSOCKS5(conn net.Conn, cfg *ProxyConfig) {
-	conn.Write([]byte{0x05, 0x00})
-	buf := make([]byte, 262)
-	io.ReadFull(conn, buf[:4])
-	if buf[1] != 0x01 {
-		return
-	}
-	var target string
-	switch buf[3] {
-	case 1:
-		io.ReadFull(conn, buf[:4])
-		target = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
-	case 3:
-		io.ReadFull(conn, buf[:1])
-		l := int(buf[0])
-		io.ReadFull(conn, buf[:l])
-		target = string(buf[:l])
-	}
-	io.ReadFull(conn, buf[:2])
-	target += fmt.Sprintf(":%d", int(buf[0])<<8|int(buf[1]))
-
-	id := uuid.New().String()
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-
-	echPool.Send(id, target, "", conn)
-}
-
-func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
-	// 优化：直接使用 slice append 替代 bytes.NewBuffer
-	p := make([]byte, 4096)
-	n, _ := conn.Read(p)
-	full := append([]byte{first}, p[:n]...)
-	
-	fullStr := string(full)
-	lines := strings.Split(fullStr, "\r\n")
-	parts := strings.Split(lines[0], " ")
-	if len(parts) < 2 {
-		return
-	}
-	method := parts[0]
-	urlStr := parts[1]
-
-	headers := make(map[string]string)
-	for _, l := range lines[1:] {
-		if l == "" { break }
-		hp := strings.SplitN(l, ":", 2)
-		if len(hp) == 2 {
-			headers[strings.TrimSpace(hp[0])] = strings.TrimSpace(hp[1])
-		}
-	}
-
-	if cfg.Username != "" {
-		if !validateProxyAuth(headers["Proxy-Authorization"], cfg.Username, cfg.Password) {
-			conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
+		conn.Write([]byte{0x05, 0x00})
+		h := make([]byte, 4)
+		io.ReadFull(conn, h)
+		if h[1] != 0x01 {
+			conn.Close()
 			return
 		}
-	}
-
-	var target string
-	if method == "CONNECT" {
-		target = urlStr
-		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-		fullStr = ""
+		var tgt string
+		switch h[3] {
+		case 1:
+			b := make([]byte, 4)
+			io.ReadFull(conn, b)
+			tgt = fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
+		case 3:
+			b := make([]byte, 1)
+			io.ReadFull(conn, b)
+			d := make([]byte, int(b[0]))
+			io.ReadFull(conn, d)
+			tgt = string(d)
+		}
+		pb := make([]byte, 2)
+		io.ReadFull(conn, pb)
+		tgt += fmt.Sprintf(":%d", int(pb[0])<<8|int(pb[1]))
+		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		echPool.Send(uuid.New().String(), tgt, "", conn)
 	} else {
-		u, err := url.Parse(urlStr)
-		if err != nil || u == nil { return }
-		target = u.Host
-		if target == "" {
-			for _, l := range lines {
-				if strings.HasPrefix(l, "Host:") {
-					target = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
-					break
+		// Simple HTTP
+		p := make([]byte, 4096)
+		n, _ := conn.Read(p)
+		// 修复：使用 append 拼接，不依赖 bytes 包
+		full := append([]byte{b[0]}, p[:n]...)
+		fullStr := string(full)
+
+		lines := strings.Split(fullStr, "\r\n")
+		parts := strings.Split(lines[0], " ")
+		if len(parts) < 2 {
+			conn.Close()
+			return
+		}
+		var tgt string
+		if parts[0] == "CONNECT" {
+			tgt = parts[1]
+			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			fullStr = ""
+		} else {
+			u, _ := url.Parse(parts[1])
+			tgt = u.Host
+			if tgt == "" {
+				for _, l := range lines {
+					if strings.HasPrefix(l, "Host:") {
+						tgt = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
+						break
+					}
 				}
 			}
+			if !strings.Contains(tgt, ":") {
+				tgt += ":80"
+			}
 		}
-		if !strings.Contains(target, ":") {
-			target += ":80"
-		}
+		echPool.Send(uuid.New().String(), tgt, fullStr, conn)
 	}
-
-	id := uuid.New().String()
-	echPool.Send(id, target, fullStr, conn)
 }
