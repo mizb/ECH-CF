@@ -1,50 +1,28 @@
-# --- 第一阶段：编译构建 ---
 FROM golang:alpine AS builder
-
-# 安装 git (go mod 需要)
 RUN apk add --no-cache git
-
 WORKDIR /src
-
-# 1. 复制依赖定义
 COPY go.mod ./
-
-# 2. 复制源代码
 COPY main.go .
-
-# 3. 下载依赖 (设置代理防止超时)
 ENV GOPROXY=https://goproxy.io,direct
 RUN go mod tidy && go mod download
-
-# 4. 静态编译 (减小体积)
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o ech-tunnel main.go
 
-# --- 第二阶段：运行时环境 ---
 FROM alpine:latest
-
-# 安装根证书
-RUN apk add --no-cache ca-certificates tzdata
-
+RUN apk add --no-cache ca-certificates tzdata libc6-compat
 WORKDIR /app
 
-# 5. 从构建阶段复制编译好的程序
-COPY --from=builder /src/ech-tunnel /app/ech-tunnel
-
-# 6. [关键] 直接写入启动脚本 (适配这份源码的参数)
-# 自动处理 proxy:// 前缀，自动映射环境变量
+# [关键修复] 这里的脚本不再删除 proxy:// 前缀
 RUN printf '#!/bin/sh\n\
 \n\
-# 默认监听地址 (容器内必须监听 0。0。0。0)\n\
-LISTEN_ADDR="0.0.0.0:1080"\n\
+# 默认监听地址\n\
+LISTEN_ADDR="proxy://0.0.0.0:1080"\n\
 \n\
-# 1. 处理监听地址\n\
+# 1. 处理监听地址 (原样传递，不删除前缀)\n\
 if [ -n "$ECH_LISTEN" ]; then\n\
-    # 移除 proxy:// 前缀，防止报错\n\
-    CLEAN_LISTEN=$(echo "$ECH_LISTEN" | sed "s|proxy://||g")\n\
-    LISTEN_ADDR="$CLEAN_LISTEN"\n\
+    LISTEN_ADDR="$ECH_LISTEN"\n\
 fi\n\
 \n\
-# 2。 构建基础命令\n\
+# 2. 构建基础命令\n\
 set -- /app/ech-tunnel -l "$LISTEN_ADDR"\n\
 \n\
 # 3. 必填参数\n\
@@ -69,8 +47,6 @@ echo "Exec: $@"\n\
 exec "$@"\n\
 ' > /app/entrypoint.sh
 
-# 7. 赋予权限
+COPY --from=builder /src/ech-tunnel /app/ech-tunnel
 RUN chmod +x /app/ech-tunnel /app/entrypoint.sh
-
-# 8. 入口
 ENTRYPOINT ["/app/entrypoint.sh"]
