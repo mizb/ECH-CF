@@ -1,35 +1,36 @@
-# 使用最基础的 Alpine 镜像
+# 1. 基础镜像
 FROM alpine:latest
 
-# 安装运行时库
+# 2. 安装依赖 (支持 Go 二进制运行)
 RUN apk add --no-cache ca-certificates libc6-compat tzdata
 
 WORKDIR /app
 
-# 1. 复制二进制文件 (确保文件名完全一致)
+# 3. 复制你的二进制文件 (必须确保仓库里有这个文件)
 COPY ech-workers-linux-amd64 /app/ech-tunnel
 
-# 2. [绝杀] 直接在 Dockerfile 里生成启动脚本
-# 这样绝对不会有 Windows 换行符问题
+# 4. [核心] 直接写入启动脚本
+# 注意：这里适配了你提供的二进制文件特性（不支持 proxy:// 前缀，不支持 -n 参数）
 RUN printf '#!/bin/sh\n\
 \n\
-# 设置二进制路径\n\
-set -- /app/ech-tunnel\n\
+# 默认参数\n\
+LISTEN_ADDR="127。0。0。1:30000"\n\
 \n\
-# 1. 监听地址\n\
+# 1. 处理监听地址 (去除 proxy:// 前缀)\n\
 if [ -n "$ECH_LISTEN" ]; then\n\
-    set -- "$@" -l "$ECH_LISTEN"\n\
-else\n\
-    echo "Info: Default listen 127.0.0.1:30000"\n\
-    set -- "$@" -l "127.0.0.1:30000"\n\
+    # 使用 sed 删除 proxy:// 如果存在\n\
+    CLEAN_LISTEN=$(echo "$ECH_LISTEN" | sed "s|proxy://||g")\n\
+    LISTEN_ADDR="$CLEAN_LISTEN"\n\
 fi\n\
 \n\
-# 2. 转发目标\n\
+# 2. 构建参数列表\n\
+set -- /app/ech-tunnel -l "$LISTEN_ADDR"\n\
+\n\
+# 3。 必填参数检测\n\
 if [ -n "$ECH_FORWARD" ]; then\n\
     set -- "$@" -f "$ECH_FORWARD"\n\
 fi\n\
 \n\
-# 3. Token (必填)\n\
 if [ -n "$ECH_TOKEN" ]; then\n\
     set -- "$@" -token "$ECH_TOKEN"\n\
 else\n\
@@ -37,7 +38,7 @@ else\n\
     exit 1\n\
 fi\n\
 \n\
-# 4. 其他参数\n\
+# 4。 选填参数\n\
 if [ -n "$ECH_EXIT_IP" ]; then set -- "$@" -ip "$ECH_EXIT_IP"; fi\n\
 if [ -n "$ECH_DOMAIN" ]; then set -- "$@" -ech "$ECH_DOMAIN"; fi\n\
 if [ -n "$ECH_DNS" ]; then set -- "$@" -dns "$ECH_DNS"; fi\n\
@@ -47,8 +48,8 @@ echo "Exec: $@"\n\
 exec "$@"\n\
 ' > /app/entrypoint.sh
 
-# 3. 赋予权限
+# 5. 赋予权限
 RUN chmod +x /app/ech-tunnel /app/entrypoint.sh
 
-# 4. 设置入口
+# 6. 启动
 ENTRYPOINT ["/app/entrypoint.sh"]
