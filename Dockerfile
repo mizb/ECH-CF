@@ -6,11 +6,11 @@ RUN apk add --no-cache ca-certificates libc6-compat tzdata
 
 WORKDIR /app
 
-# 1. 复制二进制文件 (确保你的仓库里有 ech-workers-linux-amd64)
+# 1. 复制二进制文件 (确保文件名完全一致)
 COPY ech-workers-linux-amd64 /app/ech-tunnel
 
-# 2. [核弹级修复] 直接在 Dockerfile 里生成启动脚本
-# 这样可以彻底避开 Windows 换行符问题
+# 2. [绝杀] 直接在 Dockerfile 里生成启动脚本
+# 这样绝对不会有 Windows 换行符问题
 RUN printf '#!/bin/sh\n\
 \n\
 # 设置二进制路径\n\
