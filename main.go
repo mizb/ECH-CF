@@ -44,14 +44,14 @@ var (
 
 func init() {
 	flag.StringVar(&listenAddr, "l", "", "监听地址 (例如 proxy://0.0.0.0:1080)")
-	flag.StringVar(&forwardAddr, "f", "", "服务端地址 (支持逗号分隔: wss://a.com,wss://b.com)")
+	flag.StringVar(&forwardAddr, "f", "", "服务端地址 (支持逗号分隔)")
 	flag.StringVar(&ipAddr, "ip", "", "指定解析 IP (仅客户端)")
 	flag.StringVar(&token, "token", "", "认证 Token")
 	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "DNS 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
 	flag.IntVar(&connectionNum, "n", 7, "单地址并发通道数")
-	
-	// 为了兼容旧版参数解析，这里添加一些未使用参数的占位，避免报错
+
+	// 兼容性占位 (避免 Docker 报错)
 	var dummy string
 	flag.StringVar(&dummy, "cert", "", "ignored")
 	flag.StringVar(&dummy, "key", "", "ignored")
@@ -61,20 +61,20 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// 解析服务端地址列表
+	// 解析服务端地址
 	var forwardAddrs []string
 	if forwardAddr != "" {
 		parts := strings.Split(forwardAddr, ",")
 		for _, p := range parts {
-			trimmed := strings.TrimSpace(p)
-			if trimmed != "" {
-				forwardAddrs = append(forwardAddrs, trimmed)
+			t := strings.TrimSpace(p)
+			if t != "" {
+				forwardAddrs = append(forwardAddrs, t)
 			}
 		}
 	}
 
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
-		log.Fatal("当前版本仅支持客户端/代理模式 (Client/Proxy Mode Only)")
+		log.Fatal("当前版本仅支持客户端模式")
 	}
 
 	if strings.HasPrefix(listenAddr, "tcp://") {
@@ -196,14 +196,14 @@ func parseDNSResponse(b []byte) (string, error) {
 			}
 			off++
 		}
-		if off+10 > len(b) {
+		if offsetCheck(off + 10, len(b)) {
 			break
 		}
 		rtype := binary.BigEndian.Uint16(b[off : off+2])
 		off += 8
 		dlen := binary.BigEndian.Uint16(b[off : off+2])
 		off += 2
-		if off+int(dlen) > len(b) {
+		if offsetCheck(off+int(dlen), len(b)) {
 			break
 		}
 		if rtype == typeHTTPS {
@@ -212,6 +212,10 @@ func parseDNSResponse(b []byte) (string, error) {
 		off += int(dlen)
 	}
 	return "", nil
+}
+
+func offsetCheck(need, total int) bool {
+	return need > total
 }
 
 func parseHTTPSRecord(d []byte) string {
@@ -243,19 +247,17 @@ func parseHTTPSRecord(d []byte) string {
 	return ""
 }
 
-// ======================== ECH Pool (Super Racing Mode) ========================
+// ======================== ECH Pool (Racing) ========================
 
 type ECHPool struct {
 	wsServerAddrs []string
 	perAddrNum    int
 	totalNum      int
-
-	conns []*websocket.Conn
-	locks []sync.Mutex
-
-	tcpMap    sync.Map // id -> net.Conn
-	chMap     sync.Map // id -> channelIndex (winner)
-	connected sync.Map // id -> chan bool
+	conns         []*websocket.Conn
+	locks         []sync.Mutex
+	tcpMap        sync.Map
+	chMap         sync.Map
+	connected     sync.Map
 }
 
 func NewECHPool(addrs []string, n int) *ECHPool {
@@ -277,14 +279,14 @@ func (p *ECHPool) Start() {
 			globalIdx++
 		}
 	}
-	log.Printf("[连接池] 启动完成。总通道数: %d (地址数:%d * 并发:%d)", p.totalNum, len(p.wsServerAddrs), p.perAddrNum)
+	log.Printf("[连接池] 启动: 总通道%d (地址%d * 并发%d)", p.totalNum, len(p.wsServerAddrs), p.perAddrNum)
 }
 
 func (p *ECHPool) maintainConn(idx int, addr string) {
 	for {
 		ws, err := dialWebSocketWithECH(addr, 2)
 		if err != nil {
-			log.Printf("[通道-%d] 连接 %s 失败，2s后重试...", idx, addr)
+			log.Printf("[通道-%d] 连接 %s 失败, 2s重试", idx, addr)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -299,8 +301,8 @@ func (p *ECHPool) RegisterAndClaim(connID, target, first string, tcpConn net.Con
 	p.tcpMap.Store(connID, tcpConn)
 	ch := make(chan bool, 1)
 	p.connected.Store(connID, ch)
+	p.chMap.Store(connID+"_META", fmt.Sprintf("%s|%s", target, first))
 
-	// 广播竞速
 	for i := 0; i < p.totalNum; i++ {
 		ws := p.conns[i]
 		if ws == nil {
@@ -312,7 +314,6 @@ func (p *ECHPool) RegisterAndClaim(connID, target, first string, tcpConn net.Con
 			p.locks[idx].Unlock()
 		}(i, ws)
 	}
-	p.chMap.Store(connID+"_META", fmt.Sprintf("%s|%s", target, first))
 }
 
 func (p *ECHPool) WaitConnected(connID string, timeout time.Duration) bool {
@@ -338,17 +339,17 @@ func (p *ECHPool) SendData(connID string, data []byte) error {
 	ws := p.conns[idx]
 	if ws == nil {
 		p.locks[idx].Unlock()
-		return fmt.Errorf("ws closed")
+		return fmt.Errorf("closed")
 	}
 	err := ws.WriteMessage(websocket.TextMessage, []byte("DATA:"+connID+"|"+string(data)))
 	p.locks[idx].Unlock()
 	return err
 }
 
-func (p *ECHPool) SendClose(connID string) error {
+func (p *ECHPool) SendClose(connID string) {
 	v, ok := p.chMap.Load(connID)
 	if !ok {
-		return nil
+		return
 	}
 	idx := v.(int)
 	p.locks[idx].Lock()
@@ -357,7 +358,6 @@ func (p *ECHPool) SendClose(connID string) error {
 		ws.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+connID))
 	}
 	p.locks[idx].Unlock()
-	return nil
 }
 
 func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
@@ -371,11 +371,11 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 		defer tk.Stop()
 		for range tk.C {
 			p.locks[idx].Lock()
-			err := ws.WriteMessage(websocket.PingMessage, nil)
-			p.locks[idx].Unlock()
-			if err != nil {
+			if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+				p.locks[idx].Unlock()
 				return
 			}
+			p.locks[idx].Unlock()
 		}
 	}()
 
@@ -385,9 +385,6 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 			return
 		}
 		if mt == websocket.BinaryMessage {
-			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
-				continue
-			}
 			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
 				parts := strings.SplitN(string(msg[5:]), "|", 2)
 				if len(parts) == 2 {
@@ -395,8 +392,8 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 						c.(net.Conn).Write([]byte(parts[1]))
 					}
 				}
-				continue
 			}
+			continue
 		}
 		if mt == websocket.TextMessage {
 			s := string(msg)
@@ -438,15 +435,19 @@ func (p *ECHPool) handleConn(idx int, ws *websocket.Conn) {
 
 func runTCPClient(listen string, addrs []string) {
 	listen = strings.TrimPrefix(listen, "tcp://")
+	parts := strings.Split(listen, "/")
+	if len(parts) < 2 {
+		log.Fatal("TCP 模式必须指定目标地址: tcp://listen/target")
+	}
+	
 	echPool = NewECHPool(addrs, connectionNum)
 	echPool.Start()
 
-	parts := strings.Split(listen, "/")
 	l, err := net.Listen("tcp", parts[0])
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("TCP 监听启动: %s -> %s", parts[0], parts[1])
+	log.Printf("TCP 监听: %s -> %s", parts[0], parts[1])
 
 	for {
 		c, err := l.Accept()
@@ -459,7 +460,8 @@ func runTCPClient(listen string, addrs []string) {
 			c.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, _ := c.Read(p)
 			c.SetReadDeadline(time.Time{})
-
+			
+			// 如果 n=0 (连接即断开), 仍尝试建立连接但数据为空
 			echPool.RegisterAndClaim(id, parts[1], string(p[:n]), c)
 			if !echPool.WaitConnected(id, 5*time.Second) {
 				c.Close()
@@ -520,7 +522,12 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 		}
 		if ipAddr != "" {
 			dialer.NetDial = func(network, addr string) (net.Conn, error) {
-				_, port, _ := net.SplitHostPort(addr)
+				// 修复: Cloudflare WSS 可能省略端口, 手动补全
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					// 假设是 443
+					port = "443"
+				}
 				return net.DialTimeout(network, net.JoinHostPort(ipAddr, port), 5*time.Second)
 			}
 		}
@@ -533,7 +540,7 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 		}
 		return ws, nil
 	}
-	return nil, fmt.Errorf("failed to connect")
+	return nil, fmt.Errorf("failed")
 }
 
 // ======================== Proxy Helpers ========================
@@ -556,6 +563,22 @@ func parseProxyAddr(addr string) (*ProxyConfig, error) {
 		c.Host = addr
 	}
 	return c, nil
+}
+
+func validateProxyAuth(authHeader, username, password string) bool {
+	if authHeader == "" {
+		return false
+	}
+	if !strings.HasPrefix(authHeader, "Basic ") {
+		return false
+	}
+	encoded := strings.TrimPrefix(authHeader, "Basic ")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	return len(parts) == 2 && parts[0] == username && parts[1] == password
 }
 
 func handleProxyConnection(conn net.Conn, cfg *ProxyConfig) {
@@ -618,7 +641,7 @@ func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
 	p := make([]byte, 4096)
 	n, _ := conn.Read(p)
 	full := append(buf.Bytes(), p[:n]...)
-	
+
 	lines := strings.Split(string(full), "\r\n")
 	parts := strings.Split(lines[0], " ")
 	if len(parts) < 2 {
@@ -626,14 +649,36 @@ func handleHTTP(conn net.Conn, cfg *ProxyConfig, first byte) {
 	}
 	method := parts[0]
 	urlStr := parts[1]
-	
+
+	headers := make(map[string]string)
+	for _, l := range lines[1:] {
+		if l == "" {
+			break
+		}
+		hp := strings.SplitN(l, ":", 2)
+		if len(hp) == 2 {
+			headers[strings.TrimSpace(hp[0])] = strings.TrimSpace(hp[1])
+		}
+	}
+
+	if cfg.Username != "" {
+		if !validateProxyAuth(headers["Proxy-Authorization"], cfg.Username, cfg.Password) {
+			conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
+			return
+		}
+	}
+
 	var target string
 	if method == "CONNECT" {
 		target = urlStr
 		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 		full = nil
 	} else {
-		u, _ := url.Parse(urlStr)
+		u, err := url.Parse(urlStr)
+		if err != nil || u == nil {
+			// URL 解析失败，无法继续转发
+			return
+		}
 		target = u.Host
 		if target == "" {
 			for _, l := range lines {
