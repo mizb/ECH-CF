@@ -1900,12 +1900,12 @@ func handleSOCKS5UDPAssociate(tcpConn net.Conn, clientAddr string, config *Proxy
 	// 生成连接ID并创建UDP关联
 	connID := uuid.New().String()
 	assoc := &UDPAssociation{
-		connID:      connID,
-		tcpConn:     tcpConn,
-		udpListener: udpListener,
-		pool:        echPool,
-		done:        make(chan bool, 2),
-		connected:   make(chan bool, 1),
+		connID:        connID,
+		tcpConn:       tcpConn,
+		udpListener:   udpListener,
+		pool:          echPool,
+		done:          make(chan bool, 2),
+		connected:     make(chan bool, 1),
 	}
 
 	// 注册到连接池
@@ -2235,7 +2235,7 @@ func buildSOCKS5UDPPacket(host string, port int, data []byte) ([]byte, error) {
 
 // ======================== HTTP 代理协议处理 ========================
 
-func handleHTTPProtocol(conn net.Conn, config *ProxyConfig, clientAddr string, firstByte byte) {
+func handleHTTPProtocol(conn net.Conn, config *ProxyConfig, clientAddr, firstByte byte) {
 	// 读取完整的第一行（HTTP 请求行）
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
 
