@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -17,6 +16,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/http" // [修复1] 补回 http 包
 	"net/url"
 	"strings"
 	"sync"
@@ -66,21 +66,21 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// 简单的参数校验
+	// 参数格式检查
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
-		runWebSocketServer(listenAddr)
-		return
+		// 虽然这里禁用了服务端模式，但为了编译通过，下面的 runWebSocketServer 依然需要 http 包
+		log.Fatal("当前版本仅支持客户端/代理模式")
 	}
 	if strings.HasPrefix(listenAddr, "tcp://") {
 		if err := prepareECH(); err != nil {
-			log.Fatalf("[客户端] 获取 ECH 失败: %v", err)
+			log.Fatalf("获取 ECH 失败: %v", err)
 		}
 		runTCPClient(listenAddr, forwardAddr)
 		return
 	}
 	if strings.HasPrefix(listenAddr, "proxy://") {
 		if err := prepareECH(); err != nil {
-			log.Fatalf("[代理] 获取 ECH 失败: %v", err)
+			log.Fatalf("获取 ECH 失败: %v", err)
 		}
 		runProxyServer(listenAddr, forwardAddr)
 		return
@@ -106,7 +106,6 @@ const typeHTTPS = 65
 
 func prepareECH() error {
 	for {
-		// log.Printf("[Init] 查询 ECH: %s", echDomain)
 		b64, err := queryHTTPSRecord(echDomain, dnsServer)
 		if err != nil || b64 == "" {
 			time.Sleep(2 * time.Second)
@@ -120,7 +119,6 @@ func prepareECH() error {
 		echListMu.Lock()
 		echList = raw
 		echListMu.Unlock()
-		// log.Printf("[Init] ECH 成功")
 		return nil
 	}
 }
@@ -248,7 +246,7 @@ func parseHTTPSRecord(d []byte) string {
 	return ""
 }
 
-// ======================== Server (Certificate Gen included) ========================
+// ======================== Server ========================
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	k, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -310,14 +308,6 @@ func handleWebSocket(ws *websocket.Conn) {
 	var mu sync.Mutex
 	var connMu sync.RWMutex
 	conns := make(map[string]net.Conn)
-	
-	defer func() {
-		connMu.Lock()
-		for _, c := range conns { c.Close() }
-		connMu.Unlock()
-		ws.Close()
-	}()
-
 	ws.SetPingHandler(func(d string) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -325,7 +315,9 @@ func handleWebSocket(ws *websocket.Conn) {
 	})
 	for {
 		mt, msg, err := ws.ReadMessage()
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		if mt == websocket.BinaryMessage {
 			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
 				parts := strings.SplitN(string(msg[5:]), "|", 2)
@@ -333,7 +325,9 @@ func handleWebSocket(ws *websocket.Conn) {
 					connMu.RLock()
 					c, ok := conns[parts[0]]
 					connMu.RUnlock()
-					if ok { c.Write([]byte(parts[1])) }
+					if ok {
+						c.Write([]byte(parts[1]))
+					}
 				}
 			}
 			continue
@@ -345,7 +339,9 @@ func handleWebSocket(ws *websocket.Conn) {
 				if len(parts) >= 2 {
 					id, tgt := parts[0], parts[1]
 					first := ""
-					if len(parts) == 3 { first = parts[2] }
+					if len(parts) == 3 {
+						first = parts[2]
+					}
 					go handleTCPConn(ws, &mu, &connMu, conns, id, tgt, first)
 				}
 			} else if strings.HasPrefix(s, "CLOSE:") {
@@ -362,7 +358,7 @@ func handleWebSocket(ws *websocket.Conn) {
 }
 
 func handleTCPConn(ws *websocket.Conn, mu *sync.Mutex, connMu *sync.RWMutex, conns map[string]net.Conn, id, tgt, first string) {
-	c, err := net.DialTimeout("tcp", tgt, 10*time.Second)
+	c, err := net.Dial("tcp", tgt)
 	if err != nil {
 		mu.Lock()
 		ws.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
@@ -399,7 +395,7 @@ func handleTCPConn(ws *websocket.Conn, mu *sync.Mutex, connMu *sync.RWMutex, con
 	}
 }
 
-// ======================== Client Pool (Simple) ========================
+// ======================== Client Pool ========================
 
 type ECHPool struct {
 	wsAddr string
@@ -432,7 +428,7 @@ func (p *ECHPool) dial(idx int) {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		// log.Printf("通道 %d 已连接", idx)
+		log.Printf("通道 %d 已连接", idx)
 		p.conns[idx] = ws
 		p.handle(idx, ws)
 		time.Sleep(1 * time.Second)
@@ -597,7 +593,7 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 	return nil, fmt.Errorf("fail")
 }
 
-// ======================== Proxy Helpers ========================
+// ======================== Proxy ========================
 
 type ProxyConfig struct {
 	Username, Password, Host string
@@ -620,74 +616,75 @@ func parseProxyAddr(addr string) (*ProxyConfig, error) {
 }
 
 func handleProxy(conn net.Conn, cfg *ProxyConfig) {
-	// 读取首字节判断协议，不使用 bufio 以避免 unused 错误
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	b := make([]byte, 1)
+	if _, err := io.ReadFull(conn, b); err != nil {
+		conn。Close()
 		return
 	}
-	
-	if buf[0] == 0x05 {
-		// SOCKS5 处理
-		conn.Write([]byte{0x05, 0x00})
+	conn。SetReadDeadline(time。Time{})
+	if b[0] == 0x05 {
+		conn。Write([]byte{0x05， 0x00})
 		h := make([]byte, 4)
-		io.ReadFull(conn, h)
+		io。ReadFull(conn, h)
+		if h[1] != 0x01 {
+			conn。Close()
+			return
+		}
 		var tgt string
 		switch h[3] {
 		case 1:
 			b := make([]byte, 4)
-			io.ReadFull(conn, b)
-			tgt = fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
+			io。ReadFull(conn, b)
+			tgt = fmt。Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3])
 		case 3:
 			b := make([]byte, 1)
-			io.ReadFull(conn, b)
+			io。ReadFull(conn, b)
 			d := make([]byte, int(b[0]))
-			io.ReadFull(conn, d)
+			io。ReadFull(conn, d)
 			tgt = string(d)
 		}
 		pb := make([]byte, 2)
 		io.ReadFull(conn, pb)
 		tgt += fmt.Sprintf(":%d", int(pb[0])<<8|int(pb[1]))
-		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn。Write([]byte{0x05， 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		echPool.Send(uuid.New().String(), tgt, "", conn)
 	} else {
-		// HTTP 处理 (简化版: 直接读取 buffer 查找 host)
-		// 预读 4KB
+		// Simple HTTP
+		// [修复2] 移除 bytes.NewBuffer，直接使用 slice append
 		p := make([]byte, 4096)
-		n, _ := conn.Read(p)
-		// 拼接首字节
-		fullData := append(buf, p[:n]...)
-		fullStr := string(fullData)
+		n, _ := conn。Read(p)
 		
-		lines := strings.Split(fullStr, "\r\n")
-		parts := strings.Split(lines[0], " ")
+		// 拼接首字节和后续读取的数据
+		full := append([]byte{b[0]}, p[:n]...)
+		fullStr := string(full)
+
+		lines := strings。Split(fullStr, "\r\n")
+		parts := strings。Split(lines[0], " ")
 		if len(parts) < 2 {
 			conn.Close()
 			return
 		}
-		
 		var tgt string
 		if parts[0] == "CONNECT" {
 			tgt = parts[1]
 			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-			// 对于 CONNECT, 后续数据才是真实流量，这里 first 为空
-			echPool.Send(uuid.New().String(), tgt, "", conn)
+			fullStr = "" // CONNECT 不发送 header
 		} else {
-			// 普通 HTTP 请求
-			u, _ := url.Parse(parts[1])
+			u, _ := url。Parse(parts[1])
 			tgt = u.Host
 			if tgt == "" {
 				for _, l := range lines {
-					if strings.HasPrefix(l, "Host:") {
-						tgt = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
+					if strings。HasPrefix(l, "Host:") {
+						tgt = strings.TrimSpace(strings。TrimPrefix(l, "Host:"))
 						break
 					}
 				}
 			}
-			if !strings.Contains(tgt, ":") {
+			if !strings。Contains(tgt, ":") {
 				tgt += ":80"
 			}
-			echPool.Send(uuid.New().String(), tgt, fullStr, conn)
 		}
+		echPool.Send(uuid.New().String(), tgt, fullStr, conn)
 	}
 }
