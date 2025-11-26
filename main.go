@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -19,7 +17,6 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -42,10 +39,10 @@ var (
 	connectionNum int
 
 	// ECH/DNS 参数
-	dnsServer string // -dns
-	echDomain string // -ech
+	dnsServer string
+	echDomain string
 
-	// 运行期缓存的 ECHConfigList
+	// 运行期缓存
 	echListMu sync.RWMutex
 	echList   []byte
 
@@ -69,6 +66,7 @@ func init() {
 func main() {
 	flag.Parse()
 
+	// 简单的参数校验
 	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
 		runWebSocketServer(listenAddr)
 		return
@@ -99,10 +97,7 @@ func isNormalCloseError(err error) bool {
 		return true
 	}
 	errStr := err.Error()
-	return strings.Contains(errStr, "closed network connection") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "normal closure")
+	return strings.Contains(errStr, "closed") || strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "reset")
 }
 
 // ======================== ECH Logic ========================
@@ -111,7 +106,7 @@ const typeHTTPS = 65
 
 func prepareECH() error {
 	for {
-		log.Printf("[Init] 查询 ECH 公钥: %s via %s", echDomain, dnsServer)
+		// log.Printf("[Init] 查询 ECH: %s", echDomain)
 		b64, err := queryHTTPSRecord(echDomain, dnsServer)
 		if err != nil || b64 == "" {
 			time.Sleep(2 * time.Second)
@@ -125,14 +120,13 @@ func prepareECH() error {
 		echListMu.Lock()
 		echList = raw
 		echListMu.Unlock()
-		log.Printf("[Init] ECH 公钥获取成功")
+		// log.Printf("[Init] ECH 成功")
 		return nil
 	}
 }
 
-func refreshECH() error {
-	log.Println("刷新 ECH 配置...")
-	return prepareECH()
+func refreshECH() {
+	prepareECH()
 }
 
 func getECHList() ([]byte, error) {
@@ -144,7 +138,7 @@ func getECHList() ([]byte, error) {
 	return echList, nil
 }
 
-func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
+func buildTLSConfigWithECH(serverName string, el []byte) (*tls.Config, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil {
 		return nil, err
@@ -152,7 +146,7 @@ func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, erro
 	return &tls.Config{
 		MinVersion:                          tls.VersionTLS13,
 		ServerName:                          serverName,
-		EncryptedClientHelloConfigList:      echList,
+		EncryptedClientHelloConfigList:      el,
 		EncryptedClientHelloRejectionVerify: func(_ tls.ConnectionState) error { return errors.New("ECH rejected") },
 		RootCAs:                             roots,
 	}, nil
@@ -254,7 +248,7 @@ func parseHTTPSRecord(d []byte) string {
 	return ""
 }
 
-// ======================== Server (用于服务端模式) ========================
+// ======================== Server (Certificate Gen included) ========================
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	k, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -316,6 +310,14 @@ func handleWebSocket(ws *websocket.Conn) {
 	var mu sync.Mutex
 	var connMu sync.RWMutex
 	conns := make(map[string]net.Conn)
+	
+	defer func() {
+		connMu.Lock()
+		for _, c := range conns { c.Close() }
+		connMu.Unlock()
+		ws.Close()
+	}()
+
 	ws.SetPingHandler(func(d string) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -323,20 +325,15 @@ func handleWebSocket(ws *websocket.Conn) {
 	})
 	for {
 		mt, msg, err := ws.ReadMessage()
-		if err != nil {
-			return
-		}
+		if err != nil { return }
 		if mt == websocket.BinaryMessage {
-			// DATA:<id>|payload (binary optimization)
 			if len(msg) > 5 && string(msg[:5]) == "DATA:" {
 				parts := strings.SplitN(string(msg[5:]), "|", 2)
 				if len(parts) == 2 {
 					connMu.RLock()
 					c, ok := conns[parts[0]]
 					connMu.RUnlock()
-					if ok {
-						c.Write([]byte(parts[1]))
-					}
+					if ok { c.Write([]byte(parts[1])) }
 				}
 			}
 			continue
@@ -348,9 +345,7 @@ func handleWebSocket(ws *websocket.Conn) {
 				if len(parts) >= 2 {
 					id, tgt := parts[0], parts[1]
 					first := ""
-					if len(parts) == 3 {
-						first = parts[2]
-					}
+					if len(parts) == 3 { first = parts[2] }
 					go handleTCPConn(ws, &mu, &connMu, conns, id, tgt, first)
 				}
 			} else if strings.HasPrefix(s, "CLOSE:") {
@@ -367,7 +362,7 @@ func handleWebSocket(ws *websocket.Conn) {
 }
 
 func handleTCPConn(ws *websocket.Conn, mu *sync.Mutex, connMu *sync.RWMutex, conns map[string]net.Conn, id, tgt, first string) {
-	c, err := net.Dial("tcp", tgt)
+	c, err := net.DialTimeout("tcp", tgt, 10*time.Second)
 	if err != nil {
 		mu.Lock()
 		ws.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
@@ -437,7 +432,7 @@ func (p *ECHPool) dial(idx int) {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		log.Printf("通道 %d 已连接", idx)
+		// log.Printf("通道 %d 已连接", idx)
 		p.conns[idx] = ws
 		p.handle(idx, ws)
 		time.Sleep(1 * time.Second)
@@ -570,8 +565,10 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("must use wss")
 	}
 	dialer := websocket.Dialer{
-		Subprotocols:     []string{token},
 		HandshakeTimeout: 5 * time.Second,
+	}
+	if token != "" {
+		dialer.Subprotocols = []string{token}
 	}
 	if ipAddr != "" {
 		dialer.NetDial = func(n, a string) (net.Conn, error) {
@@ -579,13 +576,15 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 			return net.DialTimeout(n, net.JoinHostPort(ipAddr, p), 5*time.Second)
 		}
 	}
+	sn := u.Hostname()
 	for i := 0; i <= retries; i++ {
 		el, err := getECHList()
 		if err != nil {
 			refreshECH()
 			continue
 		}
-		dialer.TLSClientConfig, _ = buildTLSConfigWithECH(u.Hostname(), el)
+		cfg, _ := buildTLSConfigWithECH(sn, el)
+		dialer.TLSClientConfig = cfg
 		ws, _, err := dialer.Dial(wsAddr, nil)
 		if err != nil {
 			if strings.Contains(err.Error(), "ECH") {
@@ -598,7 +597,7 @@ func dialWebSocketWithECH(wsAddr string, retries int) (*websocket.Conn, error) {
 	return nil, fmt.Errorf("fail")
 }
 
-// ======================== Proxy ========================
+// ======================== Proxy Helpers ========================
 
 type ProxyConfig struct {
 	Username, Password, Host string
@@ -621,21 +620,18 @@ func parseProxyAddr(addr string) (*ProxyConfig, error) {
 }
 
 func handleProxy(conn net.Conn, cfg *ProxyConfig) {
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	b := make([]byte, 1)
-	if _, err := io.ReadFull(conn, b); err != nil {
+	// 读取首字节判断协议，不使用 bufio 以避免 unused 错误
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
 		conn.Close()
 		return
 	}
-	conn.SetReadDeadline(time.Time{})
-	if b[0] == 0x05 {
+	
+	if buf[0] == 0x05 {
+		// SOCKS5 处理
 		conn.Write([]byte{0x05, 0x00})
 		h := make([]byte, 4)
 		io.ReadFull(conn, h)
-		if h[1] != 0x01 {
-			conn.Close()
-			return
-		}
 		var tgt string
 		switch h[3] {
 		case 1:
@@ -655,23 +651,29 @@ func handleProxy(conn net.Conn, cfg *ProxyConfig) {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		echPool.Send(uuid.New().String(), tgt, "", conn)
 	} else {
-		// Simple HTTP
-		buf := bytes.NewBuffer(b)
+		// HTTP 处理 (简化版: 直接读取 buffer 查找 host)
+		// 预读 4KB
 		p := make([]byte, 4096)
 		n, _ := conn.Read(p)
-		full := append(buf.Bytes(), p[:n]...)
-		lines := strings.Split(string(full), "\r\n")
+		// 拼接首字节
+		fullData := append(buf, p[:n]...)
+		fullStr := string(fullData)
+		
+		lines := strings.Split(fullStr, "\r\n")
 		parts := strings.Split(lines[0], " ")
 		if len(parts) < 2 {
 			conn.Close()
 			return
 		}
+		
 		var tgt string
 		if parts[0] == "CONNECT" {
 			tgt = parts[1]
 			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-			full = nil
+			// 对于 CONNECT, 后续数据才是真实流量，这里 first 为空
+			echPool.Send(uuid.New().String(), tgt, "", conn)
 		} else {
+			// 普通 HTTP 请求
 			u, _ := url.Parse(parts[1])
 			tgt = u.Host
 			if tgt == "" {
@@ -685,7 +687,7 @@ func handleProxy(conn net.Conn, cfg *ProxyConfig) {
 			if !strings.Contains(tgt, ":") {
 				tgt += ":80"
 			}
+			echPool.Send(uuid.New().String(), tgt, fullStr, conn)
 		}
-		echPool.Send(uuid.New().String(), tgt, string(full), conn)
 	}
 }
