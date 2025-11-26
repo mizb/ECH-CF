@@ -1,19 +1,54 @@
 # 使用最基础的 Alpine 镜像
 FROM alpine:latest
 
-# 安装运行时库 + dos2unix (专门修复换行符工具)
-RUN apk add --no-cache ca-certificates libc6-compat tzdata dos2unix
+# 安装运行时库
+RUN apk add --no-cache ca-certificates libc6-compat tzdata
 
 WORKDIR /app
 
-# 1. 复制文件
+# 1. 复制二进制文件 (确保你的仓库里有 ech-workers-linux-amd64)
 COPY ech-workers-linux-amd64 /app/ech-tunnel
-COPY entrypoint.sh /app/entrypoint.sh
 
-# 2. [核弹级修复] 使用 dos2unix 强制转换脚本格式，并赋予权限
-RUN dos2unix /app/entrypoint.sh && \
-    chmod +x /app/entrypoint.sh && \
-    chmod +x /app/ech-tunnel
+# 2. [核弹级修复] 直接在 Dockerfile 里生成启动脚本
+# 这样可以彻底避开 Windows 换行符问题
+RUN printf '#!/bin/sh\n\
+\n\
+# 设置二进制路径\n\
+set -- /app/ech-tunnel\n\
+\n\
+# 1. 监听地址\n\
+if [ -n "$ECH_LISTEN" ]; then\n\
+    set -- "$@" -l "$ECH_LISTEN"\n\
+else\n\
+    echo "Info: Default listen 127.0.0.1:30000"\n\
+    set -- "$@" -l "127.0.0.1:30000"\n\
+fi\n\
+\n\
+# 2. 转发目标\n\
+if [ -n "$ECH_FORWARD" ]; then\n\
+    set -- "$@" -f "$ECH_FORWARD"\n\
+fi\n\
+\n\
+# 3. Token (必填)\n\
+if [ -n "$ECH_TOKEN" ]; then\n\
+    set -- "$@" -token "$ECH_TOKEN"\n\
+else\n\
+    echo "Error: ECH_TOKEN is required!"\n\
+    exit 1\n\
+fi\n\
+\n\
+# 4. 其他参数\n\
+if [ -n "$ECH_EXIT_IP" ]; then set -- "$@" -ip "$ECH_EXIT_IP"; fi\n\
+if [ -n "$ECH_DOMAIN" ]; then set -- "$@" -ech "$ECH_DOMAIN"; fi\n\
+if [ -n "$ECH_DNS" ]; then set -- "$@" -dns "$ECH_DNS"; fi\n\
+\n\
+echo "Starting ECH Tunnel..."\n\
+echo "Exec: $@"\n\
+exec "$@"\n\
+' > /app/entrypoint.sh
 
-# 3. 设置入口点
+# 3. 赋予权限
+RUN chmod +x /app/ech-tunnel /app/entrypoint.sh
+
+# 4. 设置入口
 ENTRYPOINT ["/app/entrypoint.sh"]
