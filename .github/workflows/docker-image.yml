@@ -5,11 +5,9 @@ on:
     branches: [ "main" ]
     paths:
       - "Dockerfile"
+      - "ech-workers-linux-amd64"
+      - "entrypoint.sh"
   workflow_dispatch:              # 允许手动触发
-
-env:
-  # 在这里修改你的镜像名，格式：DockerHub用户名/仓库名
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ech-cf
 
 jobs:
   docker:
@@ -23,20 +21,18 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          # 建议去 GitHub Settings -> Secrets 里把原来的 PASSWORD 改名为 TOKEN
-          # 或者你这里继续用 PASSWORD 也行，只要 Secrets 里有这个变量
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
           
-      # 设置 Buildx (构建工具)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: 。
+          context: .
           file: ./Dockerfile
           push: true
-          # 关键点：因为你只有 amd64 的文件，这里只能填这一种
+          # 仅构建 amd64 (对应你提供的二进制文件架构)
           platforms: linux/amd64
-          标签: mimimimimimimiiii/ech-cf:latest
+          # 指定具体的标签
+          tags: mimimimimimimiiii/ech-cf:latest
