@@ -4,9 +4,6 @@ on:
   push:
     分支: [ "main" ]
     paths:
-      - "Dockerfile"
-      - "main.go"
-      - "go.mod"
   workflow_dispatch:
 
 jobs:
