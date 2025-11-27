@@ -10,39 +10,20 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o ech-tunnel main.go
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata libc6-compat
 WORKDIR /app
-
-# [关键修复] 这里的脚本不再删除 proxy:// 前缀
+# 脚本部分保持不变...
 RUN printf '#!/bin/sh\n\
 \n\
-# 默认监听地址\n\
 LISTEN_ADDR="proxy://0.0.0.0:1080"\n\
-\n\
-# 1. 处理监听地址 (原样传递，不删除前缀)\n\
-if [ -n "$ECH_LISTEN" ]; then\n\
-    LISTEN_ADDR="$ECH_LISTEN"\n\
-fi\n\
-\n\
-# 2. 构建基础命令\n\
+if [ -n "$ECH_LISTEN" ]; then LISTEN_ADDR="$ECH_LISTEN"; fi\n\
 set -- /app/ech-tunnel -l "$LISTEN_ADDR"\n\
-\n\
-# 3. 必填参数\n\
-if [ -n "$ECH_FORWARD" ]; then\n\
-    set -- "$@" -f "$ECH_FORWARD"\n\
-fi\n\
-\n\
-if [ -n "$ECH_TOKEN" ]; then\n\
-    set -- "$@" -token "$ECH_TOKEN"\n\
-else\n\
-    echo "Error: ECH_TOKEN is required!"\n\
-    exit 1\n\
-fi\n\
-\n\
-# 4. 选填参数\n\
+if [ -n "$ECH_FORWARD" ]; then set -- "$@" -f "$ECH_FORWARD"; fi\n\
+if [ -n "$ECH_TOKEN" ]; then set -- "$@" -token "$ECH_TOKEN"; else echo "Error: ECH_TOKEN is required!"; exit 1; fi\n\
 if [ -n "$ECH_EXIT_IP" ]; then set -- "$@" -ip "$ECH_EXIT_IP"; fi\n\
 if [ -n "$ECH_DOMAIN" ]; then set -- "$@" -ech "$ECH_DOMAIN"; fi\n\
 if [ -n "$ECH_DNS" ]; then set -- "$@" -dns "$ECH_DNS"; fi\n\
+if [ -n "$ECH_CONCURRENCY" ]; then set -- "$@" -n "$ECH_CONCURRENCY"; fi\n\
 \n\
-echo "Starting ECH Tunnel (Source Built)..."\n\
+echo "Starting ECH Tunnel (Source Built)。.."\n\
 echo "Exec: $@"\n\
 exec "$@"\n\
 ' > /app/entrypoint.sh
