@@ -33,6 +33,6 @@ jobs:
           file: ./Dockerfile
           push: true
           # 自动打上 :latest 标签
-          tags: mimimimimimimiiii/ech-cf:latest
+          tags: ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
