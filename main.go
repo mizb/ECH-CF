@@ -1,19 +1,22 @@
 package main
 
 import (
-	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -26,10 +29,10 @@ import (
 
 var (
 	listenAddr    string
-	forwardAddrs  []string // 支持多个地址
+	forwardAddrs  []string
 	ipAddr        string
 	token         string
-	raceCount     int // 竞速并发数 (-n)
+	raceCount     int
 
 	dnsServer string
 	echDomain string
@@ -40,15 +43,14 @@ var (
 
 func init() {
 	var fwd string
-	flag.StringVar(&listenAddr, "l", "", "Listen Address")
-	flag.StringVar(&fwd, "f", "", "Forward Address (comma separated)")
-	flag.StringVar(&ipAddr, "ip", "", "Specific IP")
+	flag.StringVar(&listenAddr, "l", "", "Listen")
+	flag.StringVar(&fwd, "f", "", "Forward")
+	flag.StringVar(&ipAddr, "ip", "", "IP")
 	flag.StringVar(&token, "token", "", "Token")
 	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "DNS")
-	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH Domain")
-	flag.IntVar(&raceCount, "n", 3, "Race Count (concurrent dials per request)")
+	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH")
+	flag.IntVar(&raceCount, "n", 3, "N")
 	
-	// 兼容占位
 	var dummy string
 	flag.StringVar(&dummy, "cert", "", "ignored")
 	flag.StringVar(&dummy, "key", "", "ignored")
@@ -72,12 +74,11 @@ func main() {
 	}
 
 	if len(forwardAddrs) == 0 {
-		log.Fatal("Missing -f address")
+		log.Fatal("Missing -f")
 	}
 
-	// 准备 ECH
 	if err := prepareECH(); err != nil {
-		log.Fatalf("ECH Init Failed: %v", err)
+		log.Fatalf("ECH Fail: %v", err)
 	}
 
 	if strings.HasPrefix(listenAddr, "tcp://") {
@@ -85,11 +86,11 @@ func main() {
 	} else if strings.HasPrefix(listenAddr, "proxy://") {
 		runProxyServer(listenAddr)
 	} else {
-		log.Fatal("Invalid listen address")
+		log.Fatal("Invalid addr")
 	}
 }
 
-// ======================== ECH Logic ========================
+// ======================== ECH ========================
 
 const typeHTTPS = 65
 
@@ -190,83 +191,61 @@ func parseHTTPSRecord(d []byte) string {
 
 // ======================== Racing Logic ========================
 
-// 竞速拨号：并发建立多个连接，谁先完成 WebSocket 握手 + Worker 协议握手，谁就获胜
 func raceDialAndPipe(conn net.Conn, target string, firstData string) {
 	defer conn.Close()
-
-	// 上下文控制，一旦有获胜者，取消其他连接
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	resultCh := make(chan *websocket.Conn, raceCount)
 	
-	// 启动 n 个并发连接尝试
 	for i := 0; i < raceCount; i++ {
-		// 随机选择一个 Worker 地址 (简单负载均衡)
 		addr := forwardAddrs[rand.Intn(len(forwardAddrs))]
-		
 		go func(workerAddr string) {
 			ws, err := dialAndHandshake(ctx, workerAddr, target, firstData)
 			if err == nil {
 				select {
 				case resultCh <- ws:
-					// 成功提交
 				case <-ctx.Done():
-					// 晚了一步，直接关闭
 					ws.Close()
 				}
 			}
 		}(addr)
 	}
 
-	// 等待第一个成功的结果
 	var ws *websocket.Conn
 	select {
 	case ws = <-resultCh:
-		// 获胜者诞生
-		cancel() // 通知其他人停止
+		cancel()
 	case <-time.After(10 * time.Second):
-		// 全部超时
-		log.Printf("[Timeout] Racing failed for %s", target)
 		return
 	}
-
 	defer ws.Close()
-	
-	// 管道转发
 	pipe(conn, ws)
 }
 
-// 单个连接流程：WS连接 -> 发送 CONNECT -> 等待 CONNECTED
 func dialAndHandshake(ctx context.Context, wsAddr string, target, firstData string) (*websocket.Conn, error) {
-	// 检查上下文是否已取消
 	if ctx.Err() != nil { return nil, ctx.Err() }
-
 	ws, err := dialWebSocketWithECH(wsAddr)
 	if err != nil { return nil, err }
 
-	// 发送协议头
 	cmd := fmt.Sprintf("CONNECT:%s|%s", target, firstData)
 	if err := ws.WriteMessage(websocket.TextMessage, []byte(cmd)); err != nil {
 		ws.Close()
 		return nil, err
 	}
 
-	// 等待响应
 	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, msg, err := ws.ReadMessage()
-	ws.SetReadDeadline(time.Time{}) // 清除超时
+	ws.SetReadDeadline(time.Time{})
 	
 	if err != nil {
 		ws.Close()
 		return nil, err
 	}
-	
 	if string(msg) != "CONNECTED" {
 		ws.Close()
 		return nil, fmt.Errorf("refused")
 	}
-
 	return ws, nil
 }
 
@@ -281,7 +260,6 @@ func dialWebSocketWithECH(wsAddr string) (*websocket.Conn, error) {
 		}
 	}
 
-	// 这里不做重试，因为外层有竞速机制，单个失败就失败了
 	el, err := getECHList()
 	if err != nil { 
 		refreshECH()
@@ -297,8 +275,6 @@ func dialWebSocketWithECH(wsAddr string) (*websocket.Conn, error) {
 
 func pipe(conn net.Conn, ws *websocket.Conn) {
 	errCh := make(chan error, 2)
-
-	// Local -> Remote
 	go func() {
 		buf := make([]byte, 32768)
 		for {
@@ -315,8 +291,6 @@ func pipe(conn net.Conn, ws *websocket.Conn) {
 			}
 		}
 	}()
-
-	// Remote -> Local
 	go func() {
 		for {
 			_, data, err := ws.ReadMessage()
@@ -332,7 +306,6 @@ func pipe(conn net.Conn, ws *websocket.Conn) {
 			}
 		}
 	}()
-
 	<-errCh
 }
 
@@ -355,7 +328,6 @@ func runTCPClient(listen string) {
 			c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 			n, _ := c.Read(buf)
 			c.SetReadDeadline(time.Time{})
-			
 			raceDialAndPipe(c, parts[1], string(buf[:n]))
 		}()
 	}
@@ -409,50 +381,50 @@ func handleProxy(conn net.Conn, cfg *ProxyConfig) {
 		switch h[3] {
 		case 1:
 			buf := make([]byte, 4); io.ReadFull(conn, buf)
-			tgt = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+			tgt = fmt。Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
 		case 3:
 			buf := make([]byte, 1); io.ReadFull(conn, buf)
 			d := make([]byte, int(buf[0])); io.ReadFull(conn, d)
 			tgt = string(d)
 		}
 		p := make([]byte, 2); io.ReadFull(conn, p)
-		tgt += fmt.Sprintf(":%d", int(p[0])<<8|int(p[1]))
+		tgt += fmt。Sprintf(":%d"， int(p[0])<<8|int(p[1]))
 		
-		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0})
+		conn。Write([]byte{0x05， 0x00, 0x00, 0x01, 0，0,0,0， 0，0})
 		raceDialAndPipe(conn, tgt, "")
 	} else {
 		buf := make([]byte, 4096)
-		n, _ := conn.Read(buf)
+		n, _ := conn。Read(buf)
 		full := append(b, buf[:n]...)
 		str := string(full)
-		lines := strings.Split(str, "\r\n")
-		parts := strings.Split(lines[0], " ")
+		lines := strings。Split(str, "\r\n")
+		parts := strings。Split(lines[0], " ")
 		if len(parts) < 2 { conn.Close(); return }
 		
 		if cfg.Username != "" {
 			auth := ""
 			for _, l := range lines {
 				if strings.HasPrefix(l, "Proxy-Authorization:") {
-					auth = strings.TrimSpace(strings.TrimPrefix(l, "Proxy-Authorization:"))
+					auth = strings。TrimSpace(strings。TrimPrefix(l, "Proxy-Authorization:"))
 				}
 			}
 			if !validateAuth(auth, cfg.Username, cfg.Password) {
-				conn.Write([]byte("HTTP/1.1 407 Auth Required\r\n\r\n"))
-				conn.Close()
+				conn。Write([]byte("HTTP/1.1 407 Auth Required\r\n\r\n"))
+				conn。Close()
 				return
 			}
 		}
 
 		if parts[0] == "CONNECT" {
-			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			conn。Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 			raceDialAndPipe(conn, parts[1], "")
 		} else {
-			u, _ := url.Parse(parts[1])
-			tgt := u.Host
+			u, _ := url。Parse(parts[1])
+			tgt := u。Host
 			if tgt == "" {
 				for _, l := range lines {
-					if strings.HasPrefix(l, "Host:") {
-						tgt = strings.TrimSpace(strings.TrimPrefix(l, "Host:"))
+					if strings。HasPrefix(l, "Host:") {
+						tgt = strings.TrimSpace(strings。TrimPrefix(l, "Host:"))
 					}
 				}
 			}
@@ -460,4 +432,19 @@ func handleProxy(conn net.Conn, cfg *ProxyConfig) {
 			raceDialAndPipe(conn, tgt, str)
 		}
 	}
+}
+
+// 移除不必要的 TLS 证书生成逻辑，因为它只用于 Server 模式，而我们现在只跑 Client
+func generateSelfSignedCert() (tls.Certificate, error) {
+	k, _ := rsa.GenerateKey(rand.Reader, 2048)
+	tmpl := x509。Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{Organization: []string{"Self"}},
+		NotBefore: time。Now(), NotAfter: time。Now()。Add(365 * 24 * time。Hour),
+		KeyUsage: x509。KeyUsageKeyEncipherment | x509。KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509。ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	b, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &k.PublicKey, k)
+	cp := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
+	kp := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	return tls.X509KeyPair(cp, kp)
 }
