@@ -18,11 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
-// ======================== Global ========================
+// ======================== 全局参数 ========================
 
 var (
 	listenAddr   string
@@ -48,6 +47,7 @@ func init() {
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH")
 	flag.IntVar(&raceCount, "n", 3, "N")
 
+	// 兼容性占位
 	var dummy string
 	flag.StringVar(&dummy, "cert", "", "ignored")
 	flag.StringVar(&dummy, "key", "", "ignored")
@@ -66,8 +66,9 @@ func init() {
 }
 
 func main() {
-	if strings.HasPrefix(listenAddr, "ws://") {
-		log.Fatal("Server mode not supported")
+	// 彻底移除服务端模式支持，避免引入 net/http 导致未使用的错误
+	if strings.HasPrefix(listenAddr, "ws://") || strings.HasPrefix(listenAddr, "wss://") {
+		log.Fatal("Server mode not supported in this binary")
 	}
 
 	if len(forwardAddrs) == 0 {
@@ -83,8 +84,19 @@ func main() {
 	} else if strings.HasPrefix(listenAddr, "proxy://") {
 		runProxyServer(listenAddr)
 	} else {
-		log.Fatal("Invalid addr")
+		log.Fatal("Invalid addr (use tcp:// or proxy://)")
 	}
+}
+
+func isNormalCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "closed") || strings.Contains(s, "broken pipe") || strings.Contains(s, "reset")
 }
 
 // ======================== ECH Logic ========================
@@ -122,7 +134,10 @@ func getECHList() ([]byte, error) {
 }
 
 func buildTLSConfigWithECH(sn string, el []byte) (*tls.Config, error) {
-	roots, _ := x509.SystemCertPool()
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
 	return &tls.Config{
 		MinVersion:                          tls.VersionTLS13,
 		ServerName:                          sn,
@@ -237,6 +252,7 @@ func raceDialAndPipe(conn net.Conn, target string, firstData string) {
 	resultCh := make(chan *websocket.Conn, raceCount)
 
 	for i := 0; i < raceCount; i++ {
+		// 使用 math/rand，避免与 crypto/rand 冲突
 		addr := forwardAddrs[rand.Intn(len(forwardAddrs))]
 		go func(workerAddr string) {
 			ws, err := dialAndHandshake(ctx, workerAddr, target, firstData)
