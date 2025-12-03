@@ -1,18 +1,20 @@
 # === 第一阶段：构建 ===
-FROM golang:1.21-alpine AS builder
+# 1. 必须将版本升级到 1.23 (支持 ECH)
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
 ENV GOPROXY=https://proxy.golang.org,direct
 
-# 1. 先把所有文件（包括 go.mod 和 main.go）都复制进去
-# 修正点：这一步必须在 go mod tidy 之前
+# 2. 开启 ECH 实验性功能支持 (关键!)
+ENV GOEXPERIMENT=ech
+
 COPY . .
 
-# 2. 现在有了代码，tidy 才能分析出需要下载哪些依赖
 RUN go mod tidy
 
-# 3. 编译静态二进制文件
+# 3. 编译
+# 注意：GOEXPERIMENT 环境变量已经被上面的 ENV 设置了，这里会自动生效
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o app main.go
 
 # === 第二阶段：运行 ===
