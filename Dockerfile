@@ -1,40 +1,40 @@
-# 第一阶段：构建阶段
+# === 第一阶段：构建 ===
 FROM golang:1.21-alpine AS builder
 
-# 设置工作目录
 WORKDIR /app
 
-# 设置 Go 代理，加速国内构建（可选，但在 Github Actions 中通常不需要）
+# 为了国内构建速度，虽然在Github Actions里其实不需要，但保留无妨
 ENV GOPROXY=https://proxy.golang.org,direct
 
-# 复制依赖文件并下载
+# 1. 处理依赖
 COPY go.mod ./
-# 如果有 go.sum 也复制，没有则自动生成
-# COPY go.sum ./ 
+# 如果还没生成 go.sum，这一步会自动下载
 RUN go mod tidy
 
-# 复制源码
+# 2. 复制源码
 COPY . .
 
-# 编译 (CGO_ENABLED=0 确保生成静态二进制文件)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o client main.go
+# 3. 编译静态二进制文件
+# -s -w 去掉调试信息减小体积
+# CGO_ENABLED=0 确保可以在轻量级系统运行
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o app main.go
 
-# 第二阶段：运行阶段
+# === 第二阶段：运行 ===
 FROM alpine:latest
 
-# 安装基础证书（HTTPS/TLS 必须）和时区数据
+# 安装基础证书（TLS/HTTPS连接必须）和时区数据
 RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 
-# 从构建阶段复制二进制文件
-COPY --from=builder /app/client .
+# 从构建层复制编译好的程序
+COPY --from=builder /app/app .
 
-# 设置时区为上海
+# 设置时区为上海（方便查看日志）
 ENV TZ=Asia/Shanghai
 
 # 赋予执行权限
-RUN chmod +x ./client
+RUN chmod +x ./app
 
-# 容器入口
-ENTRYPOINT ["./client"]
+# 容器启动命令
+ENTRYPOINT ["./app"]
